@@ -58,7 +58,7 @@ __global__ void bfsPullDualKernel(
     int cid = -1;
     if(is_critical){
         cid = atomicAdd(&critical_count, 1);
-        critical_list[cid] = tid; 
+        if (cid < BLOCK_SIZE) critical_list[cid] = tid;
     }
 
     // 收集空闲线程
@@ -86,7 +86,7 @@ __global__ void bfsPullDualKernel(
     // ==================== 冗余计算（空闲线程执行） ====================
     if(is_idle) {
         int my_idle_id = iid;   // 本线程在 idle_list 的索引
-        if(my_idle_id < critical_count){
+        if(my_idle_id < critical_count && my_idle_id < BLOCK_SIZE){
             int target_tid = critical_list[my_idle_id];
             int redundant_newVal = d_values[target_tid];
             for (int i = d_column_offsets[target_tid]; i < d_column_offsets[target_tid + 1]; i++) {
@@ -102,7 +102,7 @@ __global__ void bfsPullDualKernel(
     // ==================== 冗余结果对比（关键线程执行） ====================
     if(is_critical){
         int my_index = cid; 
-        if(idle_count > my_index){
+        if(my_index >= 0 && my_index < idle_count && my_index < BLOCK_SIZE){
             int redundant_newVal = redundant_results[my_index];  // 冗余结果
             if(redundant_newVal != main_newVal){
                 atomicExch(&(d_info->dmr_error_flag), 1);  //将 DMR 错误写入设备端结构（单个写操作即可）
@@ -272,6 +272,7 @@ void bfsGPU(
         int prev = 1 - pingpong;
 
         // 启动第 cur 轮 kernel（依赖 d_critical[cur]，已经在上一步准备）
+        cudaMemsetAsync(d_info[cur], 0, sizeof(MonotonicInfo), stream[cur]);
         int num_blocks = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
         bfsPullDualKernel<<<num_blocks, BLOCK_SIZE, 0, stream[cur]>>>(
             d_values,d_row_offsets,d_column_indices,

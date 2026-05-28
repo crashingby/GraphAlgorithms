@@ -30,6 +30,15 @@ add_executable(bfs_tolerance bfs_tolerance.cu)
 add_executable(bfs_cub bfs_tolerance_cub.cu)
 add_executable(bfs_threshold bfs_tolerance_threshold.cu)
 add_executable(bfs_multiGPU bfs_tolerance_multiGPU.cu)
+add_executable(cc cc.cu)
+add_executable(kcore kcore.cu)
+add_executable(pagerank pagerank.cu)
+add_executable(cc_threshold cc_tolerance_threshold.cu)
+add_executable(kcore_threshold kcore_tolerance_threshold.cu)
+add_executable(pagerank_threshold pagerank_tolerance_threshold.cu)
+add_executable(cc_multiGPU cc_tolerance_multiGPU.cu)
+add_executable(kcore_multiGPU kcore_tolerance_multiGPU.cu)
+add_executable(pagerank_multiGPU pagerank_tolerance_multiGPU.cu)
 
 # -----------------------------
 # CUDA 链接
@@ -38,6 +47,12 @@ target_link_libraries(bfs PRIVATE CUDA::cudart)
 target_link_libraries(bfs_tolerance PRIVATE CUDA::cudart)
 target_link_libraries(bfs_cub PRIVATE CUDA::cudart)
 target_link_libraries(bfs_threshold PRIVATE CUDA::cudart)
+target_link_libraries(cc PRIVATE CUDA::cudart)
+target_link_libraries(kcore PRIVATE CUDA::cudart)
+target_link_libraries(pagerank PRIVATE CUDA::cudart)
+target_link_libraries(cc_threshold PRIVATE CUDA::cudart)
+target_link_libraries(kcore_threshold PRIVATE CUDA::cudart)
+target_link_libraries(pagerank_threshold PRIVATE CUDA::cudart)
 
 # -----------------------------
 # 多 GPU 版本额外链接 NCCL
@@ -56,3 +71,15 @@ set_target_properties(bfs_multiGPU PROPERTIES
     BUILD_RPATH "${NCCL_ROOT}/lib"
     INSTALL_RPATH "${NCCL_ROOT}/lib"
 )
+foreach(target cc_multiGPU kcore_multiGPU pagerank_multiGPU)
+    target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(${target}
+        PRIVATE
+        CUDA::cudart
+        ${NCCL_LIBRARY}
+    )
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH "${NCCL_ROOT}/lib"
+        INSTALL_RPATH "${NCCL_ROOT}/lib"
+    )
+endforeach()
