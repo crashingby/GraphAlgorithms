@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+#include <unistd.h>
 #include "bfs_gpu.cuh"
 #include "include/graph.h"
 #include "include/warmup.cuh"
@@ -71,9 +72,20 @@ int main(int argc, char* argv[]) // 修改此处以接收命令行参数
     
     const char* graph_file = graph_path.c_str();
     const char outFileName[] = "info_outcome.txt";
-    const int src = 0;
+    int src = 0;
     const bool run_CPU = false;
+    // --- 2. 命令行选项解析 ---
+    // 注意：我们将 optind 设置为 2，跳过已经处理的数据集编号参数
+    int opt;
+    optind = 2; 
+    while ((opt = getopt(argc, argv, "a:b:t:s:h")) != -1) { // 删掉了 g:，因为改为自动拼接
+        switch (opt) {
+            case 's': src = atoi(optarg); break;
+        }
+    }
 
+    // 打印参数确认信息
+    printf("加载数据集: %s\n", graph_file);
     cudaSetDevice(GPU_DEVICE);
 
     CsrGraph csr_graph;

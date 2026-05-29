@@ -3,7 +3,12 @@
 #include <stdlib.h>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <thread>
 #include <unistd.h>
+#include <nvToolsExt.h>
 
 #define BLOCK_SIZE 256
 #define INF 100000  
@@ -20,6 +25,28 @@ struct MonotonicInfo {
     int dmr_error_flag;       // 冗余计算不一致标志（设备端写入）
     int monotonic_error_flag; // 单调性违反标志（设备端写入）
 };
+
+struct AsyncCheckResult {
+    bool done = false;
+    long long sum_delta = 0;
+    int count_update = 0;
+    int dmr_error = 0;
+    int monotonic_error = 0;
+};
+
+struct NvtxRange {
+    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+    explicit NvtxRange(const std::string& name) : name_(name) { nvtxRangePushA(name_.c_str()); }
+    ~NvtxRange() { nvtxRangePop(); }
+
+    std::string name_;
+};
+
+inline std::string nvtx_name(const char* label, int iter) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s iter=%d gpu=%d", label, iter, GPU_DEVICE);
+    return std::string(buf);
+}
 
 // ==================== Kernel: 计算得分并根据阈值标记关键顶点 ====================
 // 替换了原来的 collectAndScoreKernel 和 markCriticalKernel
@@ -93,7 +120,7 @@ __global__ void bfsPullDualKernel(
     int cid = -1;
     if(is_critical){
         cid = atomicAdd(&critical_count, 1);
-        critical_list[cid] = tid; 
+        if (cid < BLOCK_SIZE) critical_list[cid] = tid;
     }
 
     // 收集空闲线程
@@ -121,7 +148,7 @@ __global__ void bfsPullDualKernel(
     // ==================== 冗余计算（空闲线程执行） ====================
     if(is_idle) {
         int my_idle_id = iid;   // 本线程在 idle_list 的索引
-        if(my_idle_id < critical_count){
+        if(my_idle_id < critical_count && my_idle_id < BLOCK_SIZE){
             int target_tid = critical_list[my_idle_id];
             int redundant_newVal = d_values[target_tid];
             for (int i = d_column_offsets[target_tid]; i < d_column_offsets[target_tid + 1]; i++) {
@@ -137,7 +164,7 @@ __global__ void bfsPullDualKernel(
     // ==================== 冗余结果对比（关键线程执行） ====================
     if(is_critical){
         int my_index = cid; 
-        if(idle_count > my_index){
+        if(my_index >= 0 && my_index < idle_count && my_index < BLOCK_SIZE){
             int redundant_newVal = redundant_results[my_index];  // 冗余结果
             if(redundant_newVal != main_newVal){
                 atomicExch(&(d_info->dmr_error_flag), 1);  //将 DMR 错误写入设备端结构（单个写操作即可）
@@ -220,8 +247,10 @@ void bfsGPU(
     int *d_values, *d_row_offsets, *d_column_indices;
     int *d_column_offsets, *d_row_indices, *d_active, *d_update;
     int *d_num_active;
-    int* d_delta[2];  
-    MonotonicInfo* d_info[2]; 
+    int* d_delta[2];
+    int* d_delta_scratch;
+    MonotonicInfo* d_info[2];
+    MonotonicInfo* d_info_scratch;
 
     cudaMalloc(&d_values, num_nodes * sizeof(int));
     cudaMalloc(&d_row_offsets, (num_nodes+1) * sizeof(int));
@@ -234,8 +263,10 @@ void bfsGPU(
     
     for(int i=0;i<2;i++){
         cudaMalloc(&d_delta[i], num_nodes*sizeof(int));
-        cudaMallocManaged(&d_info[i], sizeof(MonotonicInfo));
+        cudaMalloc(&d_info[i], sizeof(MonotonicInfo));
     }
+    cudaMalloc(&d_delta_scratch, num_nodes*sizeof(int));
+    cudaMalloc(&d_info_scratch, sizeof(MonotonicInfo));
 
     cudaMemcpy(d_values, h_value, num_nodes*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_row_offsets, h_row_offsets, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
@@ -245,89 +276,175 @@ void bfsGPU(
     cudaMemcpy(d_active, h_active, num_nodes*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(d_update, -1, num_nodes*sizeof(int));
 
-    cudaStream_t stream[2];
-    cudaStreamCreate(&stream[0]);
-    cudaStreamCreate(&stream[1]);
+    cudaStream_t compute_stream, check_stream;
+    cudaStreamCreate(&compute_stream);
+    cudaStreamCreateWithFlags(&check_stream, cudaStreamNonBlocking);
 
-    cudaEvent_t copy_delta_event[2], start, stop;
-    cudaEventCreateWithFlags(&copy_delta_event[0], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&copy_delta_event[1], cudaEventDisableTiming);
+    cudaEvent_t compute_done_event[2], check_done_event[2], start, stop;
+    cudaEventCreateWithFlags(&compute_done_event[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&compute_done_event[1], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&check_done_event[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&check_done_event[1], cudaEventDisableTiming);
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
 
     int iter = 0;
-    int pingpong = 0;
-    float pre_avg_delta = INF;
+    std::atomic<int> pending_check[2];
+    pending_check[0].store(0);
+    pending_check[1].store(0);
+    std::atomic<bool> check_stop(false);
+    std::vector<AsyncCheckResult> check_results(1001);
+
+    std::thread check_worker([&]() {
+        cudaSetDevice(GPU_DEVICE);
+        while (!check_stop.load(std::memory_order_relaxed)) {
+            bool progressed = false;
+            for (int buf = 0; buf < 2; ++buf) {
+                int iter_id = pending_check[buf].load(std::memory_order_acquire);
+                if (iter_id <= 0) continue;
+
+                if (cudaEventQuery(check_done_event[buf]) == cudaSuccess) {
+                    NvtxRange scan_range(nvtx_name("worker CPU scan", iter_id));
+
+                    AsyncCheckResult result;
+                    result.done = true;
+                    result.dmr_error = h_info[buf]->dmr_error_flag;
+                    result.monotonic_error = h_info[buf]->monotonic_error_flag;
+
+                    for (int i = 0; i < num_nodes; ++i) {
+                        int dv = h_delta[buf][i];
+                        if (dv != 0) {
+                            result.sum_delta += (long long)dv;
+                            result.count_update++;
+                        }
+                    }
+
+                    if (iter_id >= 0 && iter_id < (int)check_results.size()) {
+                        check_results[iter_id] = result;
+                    }
+                    pending_check[buf].store(0, std::memory_order_release);
+                    progressed = true;
+                }
+            }
+
+            if (!progressed) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    });
+
     int active_nodes = num_nodes;
     int num_blocks = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // ================= 初始化的第一次评分与标记 =================
     cudaMemset(d_num_active, 0, sizeof(int));
-    scoreAndMarkKernel<<<num_blocks, BLOCK_SIZE>>>(
-        d_active, d_row_offsets, num_nodes, max_outdegree, 
+    scoreAndMarkKernel<<<num_blocks, BLOCK_SIZE, 0, compute_stream>>>(
+        d_active, d_row_offsets, num_nodes, max_outdegree,
         alpha, beta, threshold, d_num_active
     );
 
     // ------------------- 主循环 -------------------
     while(iter < 1000) {
         iter++;
-        int cur = pingpong;
-        int prev = 1 - pingpong;
+        {
+            NvtxRange enqueue_range(nvtx_name("main enqueue bfs/check", iter));
 
-        // 1. 启动计算
-        bfsPullDualKernel<<<num_blocks, BLOCK_SIZE, 0, stream[cur]>>>(
-            d_values, d_row_offsets, d_column_indices,
-            d_column_offsets, d_row_indices,
-            d_active, d_update, num_nodes, 
-            d_delta[cur], d_info[cur], TREND_DEC
-        );
+            int check_buf = iter & 1;
+            int expected = 0;
+            bool do_async_check = pending_check[check_buf].compare_exchange_strong(
+                expected, -1, std::memory_order_acq_rel);
+            int* iter_delta = do_async_check ? d_delta[check_buf] : d_delta_scratch;
+            MonotonicInfo* iter_info = do_async_check ? d_info[check_buf] : d_info_scratch;
 
-        // 2. 状态切换
-        cudaMemcpyAsync(d_active, d_update, num_nodes * sizeof(int), cudaMemcpyDeviceToDevice, stream[cur]);
-        cudaMemsetAsync(d_update, -1, num_nodes * sizeof(int), stream[cur]);
-        
-        // 3. 异步回传检测数据
-        cudaMemcpyAsync(h_delta[cur], d_delta[cur], num_nodes * sizeof(int), cudaMemcpyDeviceToHost, stream[cur]);
-        cudaMemcpyAsync(h_info[cur], d_info[cur], sizeof(MonotonicInfo), cudaMemcpyDeviceToHost, stream[cur]);
-        cudaEventRecord(copy_delta_event[cur], stream[cur]);
+            cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), compute_stream);
 
-        // CPU 错误检测 (利用上一轮数据)
-        if(iter > 1){
-            if (cudaEventQuery(copy_delta_event[prev]) == cudaSuccess) {
-                long long sum_delta = 0;
-                int count_update = 0;
-                for (int i = 0; i < num_nodes; i++) {
-                    int dv = h_delta[prev][i];
-                    if (dv != 0) {
-                        sum_delta += (long long)dv;
-                        count_update++;
-                    }
-                }
-                float avg_delta = 0.0f;
-                if (count_update > 0) {
-                    avg_delta = fabsf((float)sum_delta) / (float)count_update;
-                    pre_avg_delta = avg_delta;
-                }
+            // 1. 启动计算
+            bfsPullDualKernel<<<num_blocks, BLOCK_SIZE, 0, compute_stream>>>(
+                d_values, d_row_offsets, d_column_indices,
+                d_column_offsets, d_row_indices,
+                d_active, d_update, num_nodes,
+                iter_delta, iter_info, TREND_DEC
+            );
+
+            if (do_async_check) {
+                NvtxRange copy_enqueue_range(nvtx_name("main enqueue check_stream D2H", iter));
+                cudaEventRecord(compute_done_event[check_buf], compute_stream);
+                cudaStreamWaitEvent(check_stream, compute_done_event[check_buf], 0);
+                cudaMemcpyAsync(h_delta[check_buf], iter_delta, num_nodes * sizeof(int), cudaMemcpyDeviceToHost, check_stream);
+                cudaMemcpyAsync(h_info[check_buf], iter_info, sizeof(MonotonicInfo), cudaMemcpyDeviceToHost, check_stream);
+                cudaEventRecord(check_done_event[check_buf], check_stream);
+                pending_check[check_buf].store(iter, std::memory_order_release);
             }
-       }
-    
-        // ================= GPU 内部计算活跃数与基于阈值的关键节点筛选 =================
-        cudaStreamSynchronize(stream[cur]); 
 
-        cudaMemsetAsync(d_num_active, 0, sizeof(int), stream[cur]);
-        scoreAndMarkKernel<<<num_blocks, BLOCK_SIZE, 0, stream[cur]>>>(
-            d_active, d_row_offsets, num_nodes, max_outdegree, 
-            alpha, beta, threshold, d_num_active
-        );
+            // 2. 状态切换
+            cudaMemcpyAsync(d_active, d_update, num_nodes * sizeof(int), cudaMemcpyDeviceToDevice, compute_stream);
+            cudaMemsetAsync(d_update, -1, num_nodes * sizeof(int), compute_stream);
+        }
+
+        // ================= GPU 内部计算活跃数与基于阈值的关键节点筛选 =================
+        {
+            NvtxRange sync_range(nvtx_name("main compute sync", iter));
+            cudaStreamSynchronize(compute_stream);
+        }
+
+        {
+            NvtxRange score_range(nvtx_name("main score active", iter));
+            cudaMemsetAsync(d_num_active, 0, sizeof(int), compute_stream);
+            scoreAndMarkKernel<<<num_blocks, BLOCK_SIZE, 0, compute_stream>>>(
+                d_active, d_row_offsets, num_nodes, max_outdegree,
+                alpha, beta, threshold, d_num_active
+            );
+        }
 
         // 获取活跃节点数量，如果为 0 直接退出
-        cudaMemcpyAsync(&active_nodes, d_num_active, sizeof(int), cudaMemcpyDeviceToHost, stream[cur]);
-        cudaStreamSynchronize(stream[cur]); 
+        {
+            NvtxRange count_range(nvtx_name("main active count sync", iter));
+            cudaMemcpyAsync(&active_nodes, d_num_active, sizeof(int), cudaMemcpyDeviceToHost, compute_stream);
+            cudaStreamSynchronize(compute_stream);
+        }
         if(active_nodes == 0) break;
+    }
 
-        pingpong = prev;
+    bool waiting_checks = true;
+    while (waiting_checks) {
+        waiting_checks = false;
+        for (int buf = 0; buf < 2; ++buf) {
+            if (pending_check[buf].load(std::memory_order_acquire) != 0) waiting_checks = true;
+        }
+        if (waiting_checks) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    check_stop.store(true, std::memory_order_release);
+    check_worker.join();
+
+    bool detected_dmr = false;
+    bool detected_monotonic = false;
+    bool detected_avg_increase = false;
+    int first_dmr_iter = -1;
+    int first_monotonic_iter = -1;
+    int first_avg_increase_iter = -1;
+    float previous_avg_delta = (float)INF;
+    for (int i = 1; i <= iter && i < (int)check_results.size(); ++i) {
+        const AsyncCheckResult& r = check_results[i];
+        if (!r.done) continue;
+
+        if (r.dmr_error && first_dmr_iter < 0) {
+            detected_dmr = true;
+            first_dmr_iter = i;
+        }
+        if (r.monotonic_error && first_monotonic_iter < 0) {
+            detected_monotonic = true;
+            first_monotonic_iter = i;
+        }
+        if (r.count_update > 0) {
+            float avg_delta = fabsf((float)r.sum_delta) / (float)r.count_update;
+            if (previous_avg_delta < (float)INF && avg_delta > previous_avg_delta && first_avg_increase_iter < 0) {
+                detected_avg_increase = true;
+                first_avg_increase_iter = i;
+            }
+            previous_avg_delta = avg_delta;
+        }
     }
 
     cudaMemcpy(h_value, d_values, num_nodes*sizeof(int), cudaMemcpyDeviceToHost);
@@ -348,13 +465,25 @@ void bfsGPU(
         cudaFree(d_delta[i]);
         cudaFree(d_info[i]);
     }
+    cudaFree(d_delta_scratch);
+    cudaFree(d_info_scratch);
     cudaFreeHost(h_active); 
     cudaFreeHost(h_delta[0]); cudaFreeHost(h_delta[1]);
     cudaFreeHost(h_info[0]); cudaFreeHost(h_info[1]);
 
-    cudaEventDestroy(copy_delta_event[0]);
-    cudaEventDestroy(copy_delta_event[1]);
-    cudaStreamDestroy(stream[0]); cudaStreamDestroy(stream[1]);
+    cudaEventDestroy(compute_done_event[0]);
+    cudaEventDestroy(compute_done_event[1]);
+    cudaEventDestroy(check_done_event[0]);
+    cudaEventDestroy(check_done_event[1]);
+    cudaStreamDestroy(check_stream);
+    cudaStreamDestroy(compute_stream);
 
     printf("GPU BFS finished in %d iterations.\n", iter);
+    printf("异步检测标记: DMR=%d", detected_dmr ? 1 : 0);
+    if (first_dmr_iter >= 0) printf("(first_iter=%d)", first_dmr_iter);
+    printf(", monotonic=%d", detected_monotonic ? 1 : 0);
+    if (first_monotonic_iter >= 0) printf("(first_iter=%d)", first_monotonic_iter);
+    printf(", avg_delta_increase=%d", detected_avg_increase ? 1 : 0);
+    if (first_avg_increase_iter >= 0) printf("(first_iter=%d)", first_avg_increase_iter);
+    printf("\n");
 }
