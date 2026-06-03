@@ -4,6 +4,7 @@
 #include <vector>
 #include "kcore_gpu.cuh"
 #include "include/graph.h"
+#include "include/output.h"
 
 #define GPU_DEVICE 0
 
@@ -71,7 +72,7 @@ bool correctTest(int n, const int* ref, const int* gpu, int k)
 int main(int argc, char **argv){
  
     const char graph_file[] = "dataset/7624.mtx";
-    const char outFileName[] = "info_outcome.txt";
+    std::string outFileName = graph_output_path("kcore", "info_outcome.txt");
     const bool run_CPU = false;
     int k = 5;
   
@@ -104,13 +105,13 @@ int main(int argc, char **argv){
     }
 
     // 输出结果
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%d\n", value[i]);
         fclose(f);
     }
-    //     FILE* f = fopen(outFileName, "w");
+    //     FILE* f = fopen(outFileName.c_str(), "w");
     // if (f) {
     //     for (int i = 0; i < csr_graph.nodes; i++)
     //         fprintf(f, "%d\n", value[i] < k ? 0 : 1 );

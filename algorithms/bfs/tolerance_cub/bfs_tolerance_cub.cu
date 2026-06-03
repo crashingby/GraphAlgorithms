@@ -2,48 +2,37 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
-#include "cc_gpu.cuh"
+#include "bfs_gpu_tolerance_cub.cuh"
 #include "include/graph.h"
-
+#include "include/output.h"
+#include"include/warmup.cuh"
+#define INF 100000
 #define GPU_DEVICE 0
 
 //-----------------------------
-// CPU CC 连通分量
+// CPU BFS 单源最短路径（无权图）
 //-----------------------------
-void ccCPU(const CsrGraph &graph, int* value)
+void bfsCPU(const CsrGraph &graph, int* dist, int src)
 {
     const int n = graph.nodes;
+    for (int i = 0; i < n; i++) dist[i] = INF;
 
-    // 初始化：每个顶点的value为自身ID
-    for (int i = 0; i < n; i++)
-        value[i] = i;
+    std::vector<int> queue;
 
-    bool changed = true;
-    while (changed)
-    {
-        changed = false;
+    dist[src] = 0;
+    queue.push_back(src);
 
-        // 遍历每个顶点
-        for (int u = 0; u < n; u++)
-        {
-            int old_val = value[u];
-
-            // 遍历邻居
-            for (int j = graph.row_offsets[u]; j < graph.row_offsets[u + 1]; ++j)
-            {
-                int v = graph.column_indices[j];
-
-                // 顶点取邻居的最大值
-                if (value[v] > value[u])
-                    value[u] = value[v];
+    for (size_t q = 0; q < queue.size(); q++) {
+        int u = queue[q];
+        for (int j = graph.row_offsets[u]; j < graph.row_offsets[u + 1]; ++j) {
+            int v = graph.column_indices[j];
+            if (dist[v] == INF) {
+                dist[v] = dist[u] + 1;
+                queue.push_back(v);
             }
-
-            if (value[u] != old_val)
-                changed = true;  // 只要有更新就继续迭代
         }
     }
 }
-
 
 //-----------------------------
 // CPU/GPU 结果正确性检测
@@ -64,14 +53,16 @@ bool correctTest(int n, const int* ref, const int* gpu)
 }
 
 
+
 //-----------------------------
 // 主函数
 //-----------------------------
 int main()
 {
-    const char graph_file[] = "dataset/1174.mtx";
-    const char outFileName[] = "info_outcome.txt";
-    const bool run_CPU = false;
+    const char graph_file[] = "dataset/13356.mtx";
+    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
+    const int src = 0;
+    const bool run_CPU = false; 
 
     cudaSetDevice(GPU_DEVICE);
 
@@ -83,34 +74,33 @@ int main()
     }
 
     int* value = (int*)malloc(sizeof(int) * csr_graph.nodes);
-
-    // GPU CC
-    ccGPU(value,
+    gpu_warmup();
+    // GPU BFS
+    bfsGPU(value,
             csr_graph.row_offsets,
             csr_graph.column_indices,
             csr_graph.column_offsets,
             csr_graph.row_indices,
             csr_graph.nodes,
-            csr_graph.edges); 
-   
+            csr_graph.edges,
+            src); 
 
     // CPU 检查
     if (run_CPU) {
         int* ref_value = (int*)malloc(sizeof(int) * csr_graph.nodes);
-        ccCPU(csr_graph, ref_value);
+        bfsCPU(csr_graph, ref_value, src);
         correctTest(csr_graph.nodes, ref_value, value);
         free(ref_value);
     }
 
     // 输出结果
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%d\n", value[i]);
         fclose(f);
     }
 
-    
     free(value);
     cudaDeviceReset();
     return 0;

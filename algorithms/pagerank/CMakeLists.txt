@@ -1,0 +1,3 @@
+add_graph_cuda_executable(pagerank pagerank basic/pagerank.cu)
+add_graph_cuda_executable(pagerank_threshold pagerank tolerance_threshold/pagerank_tolerance_threshold.cu)
+add_graph_nccl_executable(pagerank_multiGPU pagerank multigpu/pagerank_tolerance_multiGPU.cu)

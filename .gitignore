@@ -2,3 +2,5 @@ build
 dataset
 nsys
 info_outcome.txt
+outputs
+.vscode/

@@ -1,16 +1,22 @@
 cmake_minimum_required(VERSION 3.18)
-project(FlashAttention-Research LANGUAGES CXX CUDA)
+project(GraphAlgorithm LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+set(GRAPH_OUTPUT_ROOT "${CMAKE_SOURCE_DIR}/outputs" CACHE PATH "Runtime result output directory")
+
 # -----------------------------
-# NCCL 手动路径
+# NCCL manual path
 # -----------------------------
-set(NCCL_ROOT "/home/huangxy/software/nccl")
+set(NCCL_ROOT "/home/huangxy/software/nccl" CACHE PATH "NCCL installation root")
 set(NCCL_INCLUDE_DIR "${NCCL_ROOT}/include")
 set(NCCL_LIBRARY "${NCCL_ROOT}/lib/libnccl.so")
 
-# 检查 NCCL 是否存在
 if (NOT EXISTS "${NCCL_INCLUDE_DIR}/nccl.h")
     message(FATAL_ERROR "NCCL header not found: ${NCCL_INCLUDE_DIR}/nccl.h")
 endif()
@@ -21,67 +27,36 @@ endif()
 
 message(STATUS "NCCL include: ${NCCL_INCLUDE_DIR}")
 message(STATUS "NCCL library: ${NCCL_LIBRARY}")
+message(STATUS "Runtime outputs: ${GRAPH_OUTPUT_ROOT}")
 
-# -----------------------------
-# 可执行文件
-# -----------------------------
-add_executable(bfs bfs.cu)
-add_executable(bfs_tolerance bfs_tolerance.cu)
-add_executable(bfs_cub bfs_tolerance_cub.cu)
-add_executable(bfs_threshold bfs_tolerance_threshold.cu)
-add_executable(bfs_queue bfs_tolerance_queue.cu)
-add_executable(bfs_multiGPU bfs_tolerance_multiGPU.cu)
-add_executable(cc cc.cu)
-add_executable(kcore kcore.cu)
-add_executable(pagerank pagerank.cu)
-add_executable(cc_threshold cc_tolerance_threshold.cu)
-add_executable(kcore_threshold kcore_tolerance_threshold.cu)
-add_executable(pagerank_threshold pagerank_tolerance_threshold.cu)
-add_executable(cc_multiGPU cc_tolerance_multiGPU.cu)
-add_executable(kcore_multiGPU kcore_tolerance_multiGPU.cu)
-add_executable(pagerank_multiGPU pagerank_tolerance_multiGPU.cu)
-
-# -----------------------------
-# CUDA 链接
-# -----------------------------
-target_link_libraries(bfs PRIVATE CUDA::cudart)
-target_link_libraries(bfs_tolerance PRIVATE CUDA::cudart)
-target_link_libraries(bfs_cub PRIVATE CUDA::cudart)
-target_link_libraries(bfs_threshold PRIVATE CUDA::cudart CUDA::nvToolsExt)
-target_link_libraries(bfs_queue PRIVATE CUDA::cudart CUDA::nvToolsExt)
-target_link_libraries(cc PRIVATE CUDA::cudart)
-target_link_libraries(kcore PRIVATE CUDA::cudart)
-target_link_libraries(pagerank PRIVATE CUDA::cudart)
-target_link_libraries(cc_threshold PRIVATE CUDA::cudart)
-target_link_libraries(kcore_threshold PRIVATE CUDA::cudart)
-target_link_libraries(pagerank_threshold PRIVATE CUDA::cudart)
-
-# -----------------------------
-# 多 GPU 版本额外链接 NCCL
-# -----------------------------
-target_include_directories(bfs_multiGPU PRIVATE ${NCCL_INCLUDE_DIR})
-
-target_link_libraries(bfs_multiGPU
-    PRIVATE
-    CUDA::cudart
-    CUDA::nvToolsExt
-    ${NCCL_LIBRARY}
-)
-
-# 让运行时能找到 libnccl.so
-set_target_properties(bfs_multiGPU PROPERTIES
-    BUILD_RPATH "${NCCL_ROOT}/lib"
-    INSTALL_RPATH "${NCCL_ROOT}/lib"
-)
-foreach(target cc_multiGPU kcore_multiGPU pagerank_multiGPU)
-    target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
-    target_link_libraries(${target}
+function(add_graph_cuda_executable target algorithm)
+    add_executable(${target} ${ARGN})
+    target_include_directories(${target}
         PRIVATE
-        CUDA::cudart
-        ${NCCL_LIBRARY}
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
     )
+    target_link_libraries(${target} PRIVATE CUDA::cudart)
+    target_compile_definitions(${target}
+        PRIVATE
+        GRAPH_OUTPUT_ROOT="${GRAPH_OUTPUT_ROOT}"
+    )
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/${algorithm}"
+    )
+endfunction()
+
+function(add_graph_nccl_executable target algorithm)
+    add_graph_cuda_executable(${target} ${algorithm} ${ARGN})
+    target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(${target} PRIVATE ${NCCL_LIBRARY})
     set_target_properties(${target} PROPERTIES
         BUILD_RPATH "${NCCL_ROOT}/lib"
         INSTALL_RPATH "${NCCL_ROOT}/lib"
     )
-endforeach()
+endfunction()
+
+add_subdirectory(algorithms/bfs)
+add_subdirectory(algorithms/cc)
+add_subdirectory(algorithms/kcore)
+add_subdirectory(algorithms/pagerank)

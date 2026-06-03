@@ -1,46 +1,55 @@
-#include "cc_tolerance_multiGPU.cuh"
+#include "kcore_tolerance_multiGPU.cuh"
 
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 #include "include/graph.h"
+#include "include/output.h"
 
 void usage(const char* prog) {
-    printf("Usage: %s <dataset_id> [-a alpha] [-b beta] [-t threshold] [-n]\n", prog);
+    printf("Usage: %s <dataset_id> [-k k] [-a alpha] [-b beta] [-t threshold] [-n]\n", prog);
     printf("  -n  skip CPU correctness check\n");
 }
 
-void ccCPU(const CsrGraph& graph, int* value) {
+void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     const int n = graph.nodes;
-    for (int i = 0; i < n; ++i) value[i] = i;
+    std::vector<int8_t> alive(n, 1);
+
+    for (int i = 0; i < n; ++i) {
+        value[i] = graph.row_offsets[i + 1] - graph.row_offsets[i];
+    }
 
     bool changed = true;
     while (changed) {
         changed = false;
         for (int u = 0; u < n; ++u) {
-            int old = value[u];
+            if (!alive[u] || value[u] >= k) continue;
+
+            alive[u] = 0;
+            changed = true;
             for (int e = graph.row_offsets[u]; e < graph.row_offsets[u + 1]; ++e) {
                 int v = graph.column_indices[e];
-                if (value[v] > value[u]) value[u] = value[v];
+                if (alive[v] && value[v] > 0) --value[v];
             }
-            if (value[u] != old) changed = true;
         }
     }
 }
 
-bool correctTest(int n, const int* ref, const int* gpu) {
+bool correctTest(int n, const int* ref, const int* gpu, int k) {
     bool pass = true;
     int nerr = 0;
     for (int i = 0; i < n; ++i) {
-        if (ref[i] != gpu[i]) {
-            if (nerr++ < 20) {
-                printf("Node %d: CPU %d, GPU %d\n", i, ref[i], gpu[i]);
-            }
-            pass = false;
+        if (ref[i] == gpu[i]) continue;
+        if (ref[i] < k && gpu[i] < k) continue;
+
+        if (nerr++ < 20) {
+            printf("Node %d: CPU %d, GPU %d\n", i, ref[i], gpu[i]);
         }
+        pass = false;
     }
     printf("CPU check: %s\n", pass ? "PASSED" : "FAILED");
     return pass;
@@ -50,6 +59,7 @@ int main(int argc, char** argv) {
     float alpha = 0.5f;
     float beta = 0.5f;
     float threshold = 0.3f;
+    int k = 5;
     bool run_cpu = true;
 
     if (argc < 2 || argv[1][0] == '-') {
@@ -61,8 +71,9 @@ int main(int argc, char** argv) {
     optind = 2;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:b:t:nh")) != -1) {
-        if (opt == 'a') alpha = atof(optarg);
+    while ((opt = getopt(argc, argv, "k:a:b:t:nh")) != -1) {
+        if (opt == 'k') k = atoi(optarg);
+        else if (opt == 'a') alpha = atof(optarg);
         else if (opt == 'b') beta = atof(optarg);
         else if (opt == 't') threshold = atof(optarg);
         else if (opt == 'n') run_cpu = false;
@@ -73,8 +84,8 @@ int main(int argc, char** argv) {
     }
 
     printf("加载数据集: %s\n", graph_path.c_str());
-    printf("参数配置: alpha=%.2f beta=%.2f threshold=%.2f CPU_check=%s\n",
-           alpha, beta, threshold, run_cpu ? "on" : "off");
+    printf("参数配置: k=%d alpha=%.2f beta=%.2f threshold=%.2f CPU_check=%s\n",
+           k, alpha, beta, threshold, run_cpu ? "on" : "off");
 
     CsrGraph graph;
     bool undirected = false;
@@ -84,25 +95,26 @@ int main(int argc, char** argv) {
     }
 
     int* value = (int*)malloc(sizeof(int) * graph.nodes);
-    ccMultiGPU(value,
-               graph.row_offsets,
-               graph.column_indices,
-               graph.column_offsets,
-               graph.row_indices,
-               graph.nodes,
-               graph.edges,
-               alpha,
-               beta,
-               threshold);
+    kcoreMultiGPU(value,
+                  graph.row_offsets,
+                  graph.column_indices,
+                  graph.column_offsets,
+                  graph.row_indices,
+                  graph.nodes,
+                  graph.edges,
+                  k,
+                  alpha,
+                  beta,
+                  threshold);
 
     if (run_cpu) {
         int* ref = (int*)malloc(sizeof(int) * graph.nodes);
-        ccCPU(graph, ref);
-        correctTest(graph.nodes, ref, value);
+        kcoreCPU(graph, ref, k);
+        correctTest(graph.nodes, ref, value, k);
         free(ref);
     }
 
-    FILE* f = fopen("info_outcome.txt", "w");
+    FILE* f = fopen(graph_output_path("kcore", "info_outcome.txt").c_str(), "w");
     if (f) {
         for (int i = 0; i < graph.nodes; ++i) fprintf(f, "%d\n", value[i]);
         fclose(f);

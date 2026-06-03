@@ -1,0 +1,3 @@
+add_graph_cuda_executable(cc cc basic/cc.cu)
+add_graph_cuda_executable(cc_threshold cc tolerance_threshold/cc_tolerance_threshold.cu)
+add_graph_nccl_executable(cc_multiGPU cc multigpu/cc_tolerance_multiGPU.cu)

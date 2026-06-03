@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "include/graph.h"
+#include "include/output.h"
 
 namespace {
 constexpr float kPrAlpha = 0.85f;
@@ -175,7 +176,7 @@ int main(int argc, char** argv) {
         free(ref);
     }
 
-    FILE* f = fopen("info_outcome.txt", "w");
+    FILE* f = fopen(graph_output_path("pagerank", "info_outcome.txt").c_str(), "w");
     if (f) {
         for (int i = 0; i < graph.nodes; ++i) fprintf(f, "%f\n", value[i]);
         fclose(f);

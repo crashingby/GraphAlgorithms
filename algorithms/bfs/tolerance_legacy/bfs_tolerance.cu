@@ -2,10 +2,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
-#include <unistd.h>
-#include "bfs_gpu.cuh"
+#include "bfs_gpu_tolerance.cuh"
 #include "include/graph.h"
 #include "include/warmup.cuh"
+#include "include/output.h"
 #define INF 100000
 #define GPU_DEVICE 0
 
@@ -71,21 +71,10 @@ int main(int argc, char* argv[]) // 修改此处以接收命令行参数
     std::string graph_path = "dataset/" + input_id + ".mtx";
     
     const char* graph_file = graph_path.c_str();
-    const char outFileName[] = "info_outcome.txt";
-    int src = 0;
-    const bool run_CPU = false;
-    // --- 2. 命令行选项解析 ---
-    // 注意：我们将 optind 设置为 2，跳过已经处理的数据集编号参数
-    int opt;
-    optind = 2; 
-    while ((opt = getopt(argc, argv, "a:b:t:s:h")) != -1) { // 删掉了 g:，因为改为自动拼接
-        switch (opt) {
-            case 's': src = atoi(optarg); break;
-        }
-    }
+    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
+    const int src = 0;
+    const bool run_CPU = true;
 
-    // 打印参数确认信息
-    printf("加载数据集: %s\n", graph_file);
     cudaSetDevice(GPU_DEVICE);
 
     CsrGraph csr_graph;
@@ -120,7 +109,7 @@ int main(int argc, char* argv[]) // 修改此处以接收命令行参数
     }
 
     // 输出结果
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%d\n", value[i]);
@@ -128,7 +117,7 @@ int main(int argc, char* argv[]) // 修改此处以接收命令行参数
     }
 
     // // 输出结果（按 value 值排序，输出前 100 个最小的顶点）
-    // FILE* f = fopen(outFileName, "w");
+    // FILE* f = fopen(outFileName.c_str(), "w");
     // if (f) {
     //     // 将顶点和对应的 value 值组成 pair 数组
     //     std::vector<std::pair<int, int>> vertex_values;

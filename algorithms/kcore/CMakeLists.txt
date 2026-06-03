@@ -1,0 +1,3 @@
+add_graph_cuda_executable(kcore kcore basic/kcore.cu)
+add_graph_cuda_executable(kcore_threshold kcore tolerance_threshold/kcore_tolerance_threshold.cu)
+add_graph_nccl_executable(kcore_multiGPU kcore multigpu/kcore_tolerance_multiGPU.cu)

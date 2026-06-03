@@ -2,9 +2,11 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
-#include "bfs_gpu_tolerance_cub.cuh"
+#include <unistd.h>
+#include "bfs_gpu.cuh"
 #include "include/graph.h"
-#include"include/warmup.cuh"
+#include "include/warmup.cuh"
+#include "include/output.h"
 #define INF 100000
 #define GPU_DEVICE 0
 
@@ -56,13 +58,35 @@ bool correctTest(int n, const int* ref, const int* gpu)
 //-----------------------------
 // 主函数
 //-----------------------------
-int main()
+int main(int argc, char* argv[]) // 修改此处以接收命令行参数
 {
-    const char graph_file[] = "dataset/13356.mtx";
-    const char outFileName[] = "info_outcome.txt";
-    const int src = 0;
-    const bool run_CPU = false; 
+    // 1. 处理输入参数
+    if (argc < 2) {
+        printf("用法: %s <数据编号>\n", argv[0]);
+        printf("示例: %s 13356\n", argv[0]);
+        return 1;
+    }
 
+    // 动态拼接路径，例如输入 13356 得到 "dataset/13356.mtx"
+    std::string input_id = argv[1];
+    std::string graph_path = "dataset/" + input_id + ".mtx";
+    
+    const char* graph_file = graph_path.c_str();
+    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
+    int src = 0;
+    const bool run_CPU = false;
+    // --- 2. 命令行选项解析 ---
+    // 注意：我们将 optind 设置为 2，跳过已经处理的数据集编号参数
+    int opt;
+    optind = 2; 
+    while ((opt = getopt(argc, argv, "a:b:t:s:h")) != -1) { // 删掉了 g:，因为改为自动拼接
+        switch (opt) {
+            case 's': src = atoi(optarg); break;
+        }
+    }
+
+    // 打印参数确认信息
+    printf("加载数据集: %s\n", graph_file);
     cudaSetDevice(GPU_DEVICE);
 
     CsrGraph csr_graph;
@@ -73,6 +97,7 @@ int main()
     }
 
     int* value = (int*)malloc(sizeof(int) * csr_graph.nodes);
+
     gpu_warmup();
     // GPU BFS
     bfsGPU(value,
@@ -84,6 +109,9 @@ int main()
             csr_graph.edges,
             src); 
 
+
+     
+
     // CPU 检查
     if (run_CPU) {
         int* ref_value = (int*)malloc(sizeof(int) * csr_graph.nodes);
@@ -93,12 +121,38 @@ int main()
     }
 
     // 输出结果
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%d\n", value[i]);
         fclose(f);
     }
+
+    // // 输出结果（按 value 值排序，输出前 100 个最小的顶点）
+    // FILE* f = fopen(outFileName.c_str(), "w");
+    // if (f) {
+    //     // 将顶点和对应的 value 值组成 pair 数组
+    //     std::vector<std::pair<int, int>> vertex_values;
+    //     vertex_values.reserve(csr_graph.nodes);
+    //     for (int i = 0; i < csr_graph.nodes; i++) {
+    //         vertex_values.emplace_back(i, value[i]);
+    //     }
+
+    //     // 按 value 从小到大排序
+    //     std::sort(vertex_values.begin(), vertex_values.end(),
+    //             [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+    //                 return a.second < b.second;
+    //             });
+
+    //     // 输出前 100 个最小的顶点（如果不足 100 个就输出全部）
+    //     int limit = std::min(100, (int)vertex_values.size());
+    //     for (int i = 0; i < limit; i++) {
+    //         fprintf(f, "%d %d\n", vertex_values[i].first, vertex_values[i].second);
+    //     }
+
+    //     fclose(f);
+    // }
+
 
     free(value);
     cudaDeviceReset();

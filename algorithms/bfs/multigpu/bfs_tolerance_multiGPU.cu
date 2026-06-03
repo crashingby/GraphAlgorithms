@@ -6,6 +6,7 @@
 #include<unistd.h>
 #include "include/graph.h"
 #include "include/warmup.cuh"
+#include "include/output.h"
 
 // 如果你把 bfsMultiGPU 放在 .cuh 里，就 include 对应头文件。
 // 如果暂时没有单独拆头文件，也可以直接 include 这个 .cu 做测试。
@@ -68,7 +69,7 @@ int main(int argc, char **argv)
     float beta = 0.5f;
     float threshold = 0.3f;
     int src = 0;
-    const char outFileName[] = "info_outcome.txt";
+    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
     const bool run_CPU = true;
     
     // 用于存放拼接后的路径
@@ -146,7 +147,7 @@ int main(int argc, char **argv)
         free(ref_value);
     }
 
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++) {
             fprintf(f, "%d\n", value[i]);

@@ -6,6 +6,7 @@
 #include "bfs_gpu_tolerance_threshold.cuh"
 #include "include/graph.h"
 #include "include/warmup.cuh"
+#include "include/output.h"
 
 #define INF 100000
 #define GPU_DEVICE 0
@@ -65,7 +66,7 @@ int main(int argc, char **argv)
     float beta = 0.5f;
     float threshold = 0.3f;
     int src = 0;
-    const char outFileName[] = "info_outcome.txt";
+    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
     const bool run_CPU = true;
     
     // 用于存放拼接后的路径
@@ -140,7 +141,7 @@ int main(int argc, char **argv)
     }
 
     // --- 结果持久化 ---
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%d\n", value[i]);

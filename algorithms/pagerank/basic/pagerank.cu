@@ -4,6 +4,7 @@
 #include <vector>
 #include "pagerank_gpu.cuh"
 #include "include/graph.h"
+#include "include/output.h"
 
 #define INF 100000
 #define GPU_DEVICE 0
@@ -41,7 +42,7 @@ bool correctTest(int n, const float* ref, const float* gpu)
 int main()
 {
     const char graph_file[] = "dataset/13356.mtx";
-    const char outFileName[] = "info_outcome.txt";
+    std::string outFileName = graph_output_path("pagerank", "info_outcome.txt");
     const bool run_CPU = false;
 
     cudaSetDevice(GPU_DEVICE);
@@ -73,7 +74,7 @@ int main()
         free(ref_value);
     }
     // 输出结果
-    FILE* f = fopen(outFileName, "w");
+    FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
         for (int i = 0; i < csr_graph.nodes; i++)
             fprintf(f, "%f\n", value[i]);
@@ -81,7 +82,7 @@ int main()
     }
 
     // // 输出结果（按 value 值排序，输出前 20 个最大的顶点）
-    // FILE* f = fopen(outFileName, "w");
+    // FILE* f = fopen(outFileName.c_str(), "w");
     // if (f) {
     //     // 将顶点和对应的 value 值组成 pair 数组
     //     std::vector<std::pair<int, float>> vertex_values;
