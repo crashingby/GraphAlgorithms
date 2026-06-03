@@ -3,8 +3,10 @@
 #include <stdlib.h>
 #include <vector>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -13,6 +15,7 @@
 #define BLOCK_SIZE 256
 #define INF 100000  
 #define GPU_DEVICE 0
+#define CHECK_BUFFER_COUNT 64
 
 // ==================== 结构体 ====================
 enum ValueTrend {
@@ -24,11 +27,13 @@ enum ValueTrend {
 struct MonotonicInfo {
     int dmr_error_flag;       // 冗余计算不一致标志（设备端写入）
     int monotonic_error_flag; // 单调性违反标志（设备端写入）
+    unsigned long long sum_abs_delta;
+    int count_update;
 };
 
 struct AsyncCheckResult {
     bool done = false;
-    long long sum_delta = 0;
+    unsigned long long sum_abs_delta = 0;
     int count_update = 0;
     int dmr_error = 0;
     int monotonic_error = 0;
@@ -92,7 +97,6 @@ __global__ void bfsPullDualKernel(
     const int* d_active, 
     int* d_update,        // 写下一轮活跃顶点的值  
     int num_nodes,
-    int* d_delta,        // 每个顶点本轮变化幅度（设备数组）
     MonotonicInfo* d_info, // 设备端的检测标志结构体
     ValueTrend trend
 ) {
@@ -182,18 +186,18 @@ __global__ void bfsPullDualKernel(
                 // 写下一轮活跃顶点值（可能有写冲突，但仅用于激活判断）
                 d_update[dst] = d_values[dst];
             }
-            int delta = main_newVal - oldVal; 
-            d_delta[tid] = delta; 
+            int delta = main_newVal - oldVal;
+            unsigned long long abs_delta = (delta < 0)
+                ? (unsigned long long)(-(long long)delta)
+                : (unsigned long long)delta;
+            atomicAdd(&(d_info->sum_abs_delta), abs_delta);
+            atomicAdd(&(d_info->count_update), 1);
 
             // 记录单调性违反
             if ((trend == TREND_INC && delta < 0) || (trend == TREND_DEC && delta > 0)) {
                 atomicExch(&(d_info->monotonic_error_flag), 1);
             }
-        } else {
-            d_delta[tid] = 0;
         }
-    } else if (valid_tid) {
-        d_delta[tid] = 0;
     }
 }
 
@@ -227,15 +231,13 @@ void bfsGPU(
     int max_outdegree = compute_max_outdegree(h_row_offsets, num_nodes);
     
     // ------------------- 分配 Host 内存 -------------------
-    int* h_active; 
-    int* h_delta[2]; 
-    MonotonicInfo* h_info[2]; 
+    int* h_active;
+    MonotonicInfo* h_info[CHECK_BUFFER_COUNT];
 
     cudaMallocHost(&h_active, num_nodes * sizeof(int));
-    cudaMallocHost(&h_delta[0], num_nodes * sizeof(int));
-    cudaMallocHost(&h_delta[1], num_nodes * sizeof(int));
-    cudaMallocHost(&h_info[0], sizeof(MonotonicInfo));
-    cudaMallocHost(&h_info[1], sizeof(MonotonicInfo));
+    for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) {
+        cudaMallocHost(&h_info[i], sizeof(MonotonicInfo));
+    }
     
     for(int i = 0; i < num_nodes; i++){
         h_active[i] = 1;      
@@ -247,9 +249,7 @@ void bfsGPU(
     int *d_values, *d_row_offsets, *d_column_indices;
     int *d_column_offsets, *d_row_indices, *d_active, *d_update;
     int *d_num_active;
-    int* d_delta[2];
-    int* d_delta_scratch;
-    MonotonicInfo* d_info[2];
+    MonotonicInfo* d_info[CHECK_BUFFER_COUNT];
     MonotonicInfo* d_info_scratch;
 
     cudaMalloc(&d_values, num_nodes * sizeof(int));
@@ -261,11 +261,9 @@ void bfsGPU(
     cudaMalloc(&d_update, num_nodes * sizeof(int));
     cudaMalloc(&d_num_active, sizeof(int));
     
-    for(int i=0;i<2;i++){
-        cudaMalloc(&d_delta[i], num_nodes*sizeof(int));
+    for(int i = 0; i < CHECK_BUFFER_COUNT; i++){
         cudaMalloc(&d_info[i], sizeof(MonotonicInfo));
     }
-    cudaMalloc(&d_delta_scratch, num_nodes*sizeof(int));
     cudaMalloc(&d_info_scratch, sizeof(MonotonicInfo));
 
     cudaMemcpy(d_values, h_value, num_nodes*sizeof(int), cudaMemcpyHostToDevice);
@@ -280,28 +278,36 @@ void bfsGPU(
     cudaStreamCreate(&compute_stream);
     cudaStreamCreateWithFlags(&check_stream, cudaStreamNonBlocking);
 
-    cudaEvent_t compute_done_event[2], check_done_event[2], start, stop;
-    cudaEventCreateWithFlags(&compute_done_event[0], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&compute_done_event[1], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&check_done_event[0], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&check_done_event[1], cudaEventDisableTiming);
+    cudaEvent_t compute_done_event[CHECK_BUFFER_COUNT], check_done_event[CHECK_BUFFER_COUNT], start, stop;
+    for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) {
+        cudaEventCreateWithFlags(&compute_done_event[i], cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&check_done_event[i], cudaEventDisableTiming);
+    }
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
 
     int iter = 0;
-    std::atomic<int> pending_check[2];
-    pending_check[0].store(0);
-    pending_check[1].store(0);
+    std::array<std::atomic<int>, CHECK_BUFFER_COUNT> pending_check;
+    for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) {
+        pending_check[i].store(0);
+    }
     std::atomic<bool> check_stop(false);
     std::vector<AsyncCheckResult> check_results(1001);
+    bool detected_dmr = false;
+    bool detected_monotonic = false;
+    bool detected_avg_increase = false;
+    int first_dmr_iter = -1;
+    int first_monotonic_iter = -1;
+    int first_avg_increase_iter = -1;
+    float pre_avg_delta = (float)INF;
 
     std::thread check_worker([&]() {
         cudaSetDevice(GPU_DEVICE);
         while (!check_stop.load(std::memory_order_relaxed)) {
             bool progressed = false;
-            for (int buf = 0; buf < 2; ++buf) {
+            for (int buf = 0; buf < CHECK_BUFFER_COUNT; ++buf) {
                 int iter_id = pending_check[buf].load(std::memory_order_acquire);
                 if (iter_id <= 0) continue;
 
@@ -312,13 +318,24 @@ void bfsGPU(
                     result.done = true;
                     result.dmr_error = h_info[buf]->dmr_error_flag;
                     result.monotonic_error = h_info[buf]->monotonic_error_flag;
+                    result.sum_abs_delta = h_info[buf]->sum_abs_delta;
+                    result.count_update = h_info[buf]->count_update;
 
-                    for (int i = 0; i < num_nodes; ++i) {
-                        int dv = h_delta[buf][i];
-                        if (dv != 0) {
-                            result.sum_delta += (long long)dv;
-                            result.count_update++;
+                    if (result.count_update > 0) {
+                        float avg_delta = (float)result.sum_abs_delta / (float)result.count_update;
+                        if (pre_avg_delta < (float)INF && avg_delta > pre_avg_delta && first_avg_increase_iter < 0) {
+                            detected_avg_increase = true;
+                            first_avg_increase_iter = iter_id;
                         }
+                        pre_avg_delta = avg_delta;
+                    }
+                    if (result.dmr_error && first_dmr_iter < 0) {
+                        detected_dmr = true;
+                        first_dmr_iter = iter_id;
+                    }
+                    if (result.monotonic_error && first_monotonic_iter < 0) {
+                        detected_monotonic = true;
+                        first_monotonic_iter = iter_id;
                     }
 
                     if (iter_id >= 0 && iter_id < (int)check_results.size()) {
@@ -330,7 +347,7 @@ void bfsGPU(
             }
 
             if (!progressed) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::yield();
             }
         }
     });
@@ -351,11 +368,10 @@ void bfsGPU(
         {
             NvtxRange enqueue_range(nvtx_name("main enqueue bfs/check", iter));
 
-            int check_buf = iter & 1;
+            int check_buf = iter % CHECK_BUFFER_COUNT;
             int expected = 0;
             bool do_async_check = pending_check[check_buf].compare_exchange_strong(
                 expected, -1, std::memory_order_acq_rel);
-            int* iter_delta = do_async_check ? d_delta[check_buf] : d_delta_scratch;
             MonotonicInfo* iter_info = do_async_check ? d_info[check_buf] : d_info_scratch;
 
             cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), compute_stream);
@@ -365,14 +381,13 @@ void bfsGPU(
                 d_values, d_row_offsets, d_column_indices,
                 d_column_offsets, d_row_indices,
                 d_active, d_update, num_nodes,
-                iter_delta, iter_info, TREND_DEC
+                iter_info, TREND_DEC
             );
 
             if (do_async_check) {
                 NvtxRange copy_enqueue_range(nvtx_name("main enqueue check_stream D2H", iter));
                 cudaEventRecord(compute_done_event[check_buf], compute_stream);
                 cudaStreamWaitEvent(check_stream, compute_done_event[check_buf], 0);
-                cudaMemcpyAsync(h_delta[check_buf], iter_delta, num_nodes * sizeof(int), cudaMemcpyDeviceToHost, check_stream);
                 cudaMemcpyAsync(h_info[check_buf], iter_info, sizeof(MonotonicInfo), cudaMemcpyDeviceToHost, check_stream);
                 cudaEventRecord(check_done_event[check_buf], check_stream);
                 pending_check[check_buf].store(iter, std::memory_order_release);
@@ -410,42 +425,13 @@ void bfsGPU(
     bool waiting_checks = true;
     while (waiting_checks) {
         waiting_checks = false;
-        for (int buf = 0; buf < 2; ++buf) {
+        for (int buf = 0; buf < CHECK_BUFFER_COUNT; ++buf) {
             if (pending_check[buf].load(std::memory_order_acquire) != 0) waiting_checks = true;
         }
         if (waiting_checks) std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
     check_stop.store(true, std::memory_order_release);
     check_worker.join();
-
-    bool detected_dmr = false;
-    bool detected_monotonic = false;
-    bool detected_avg_increase = false;
-    int first_dmr_iter = -1;
-    int first_monotonic_iter = -1;
-    int first_avg_increase_iter = -1;
-    float previous_avg_delta = (float)INF;
-    for (int i = 1; i <= iter && i < (int)check_results.size(); ++i) {
-        const AsyncCheckResult& r = check_results[i];
-        if (!r.done) continue;
-
-        if (r.dmr_error && first_dmr_iter < 0) {
-            detected_dmr = true;
-            first_dmr_iter = i;
-        }
-        if (r.monotonic_error && first_monotonic_iter < 0) {
-            detected_monotonic = true;
-            first_monotonic_iter = i;
-        }
-        if (r.count_update > 0) {
-            float avg_delta = fabsf((float)r.sum_delta) / (float)r.count_update;
-            if (previous_avg_delta < (float)INF && avg_delta > previous_avg_delta && first_avg_increase_iter < 0) {
-                detected_avg_increase = true;
-                first_avg_increase_iter = i;
-            }
-            previous_avg_delta = avg_delta;
-        }
-    }
 
     cudaMemcpy(h_value, d_values, num_nodes*sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -461,20 +447,19 @@ void bfsGPU(
     cudaFree(d_active); cudaFree(d_update); 
     cudaFree(d_num_active); 
     
-    for (int i = 0; i < 2; i++) {
-        cudaFree(d_delta[i]);
+    for (int i = 0; i < CHECK_BUFFER_COUNT; i++) {
         cudaFree(d_info[i]);
     }
-    cudaFree(d_delta_scratch);
     cudaFree(d_info_scratch);
-    cudaFreeHost(h_active); 
-    cudaFreeHost(h_delta[0]); cudaFreeHost(h_delta[1]);
-    cudaFreeHost(h_info[0]); cudaFreeHost(h_info[1]);
+    cudaFreeHost(h_active);
+    for (int i = 0; i < CHECK_BUFFER_COUNT; i++) {
+        cudaFreeHost(h_info[i]);
+    }
 
-    cudaEventDestroy(compute_done_event[0]);
-    cudaEventDestroy(compute_done_event[1]);
-    cudaEventDestroy(check_done_event[0]);
-    cudaEventDestroy(check_done_event[1]);
+    for (int i = 0; i < CHECK_BUFFER_COUNT; i++) {
+        cudaEventDestroy(compute_done_event[i]);
+        cudaEventDestroy(check_done_event[i]);
+    }
     cudaStreamDestroy(check_stream);
     cudaStreamDestroy(compute_stream);
 
