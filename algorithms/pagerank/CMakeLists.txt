@@ -1,3 +1,9 @@
 add_graph_cuda_executable(pagerank pagerank basic/pagerank.cu)
 add_graph_cuda_executable(pagerank_threshold pagerank tolerance_threshold/pagerank_tolerance_threshold.cu)
+add_graph_cuda_executable(pagerank_queue pagerank tolerance_queue/pagerank_tolerance_queue.cu)
+add_graph_cuda_executable(pagerank_compact_queue pagerank tolerance_compact_queue/pagerank_tolerance_compact_queue.cu)
 add_graph_nccl_executable(pagerank_multiGPU pagerank multigpu/pagerank_tolerance_multiGPU.cu)
+
+target_link_libraries(pagerank_queue PRIVATE CUDA::nvToolsExt)
+target_link_libraries(pagerank_compact_queue PRIVATE CUDA::nvToolsExt)
+target_link_libraries(pagerank_multiGPU PRIVATE CUDA::nvToolsExt)

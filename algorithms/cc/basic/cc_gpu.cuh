@@ -41,11 +41,16 @@ __global__ void ccPullKernel(
 
 }
 
-// ==================== 统计并输出活跃顶点 ====================
-int count_active_nodes(int* h_active, int num_nodes) {
-    int count = 0;
-    for(int i=0;i<num_nodes;i++) if(h_active[i] != 0) count++;
-    return count;
+// ==================== GPU 统计活跃顶点 ====================
+__global__ void countActiveKernel(
+    const int* d_active,
+    int* d_num_active,
+    int num_nodes
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < num_nodes && d_active[tid] != 0) {
+        atomicAdd(d_num_active, 1);
+    }
 }
 
 // ==================== GPU BFS 主函数 ====================
@@ -68,6 +73,7 @@ void ccGPU(
     // ------------------- Device 内存 -------------------
     int *d_values, *d_row_offsets, *d_column_indices;
     int *d_column_offsets, *d_row_indices, *d_active, *d_update;
+    int *d_num_active;
 
     cudaMalloc(&d_values, num_nodes * sizeof(int));
     cudaMalloc(&d_row_offsets, (num_nodes+1) * sizeof(int));
@@ -76,6 +82,7 @@ void ccGPU(
     cudaMalloc(&d_row_indices, num_edges * sizeof(int));
     cudaMalloc(&d_active, num_nodes * sizeof(int));
     cudaMalloc(&d_update, num_nodes * sizeof(int));
+    cudaMalloc(&d_num_active, sizeof(int));
 
     cudaMemcpy(d_values, h_value, num_nodes*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_row_offsets, h_row_offsets, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
@@ -95,13 +102,9 @@ void ccGPU(
     int active_nodes = num_nodes;   // 第一轮所有节点活跃
     int num_blocks = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    while(iter < 1000) {
+    while(iter < 1000 && active_nodes > 0) {
 
         iter++;
-         // 拷贝到 Host 统计并输出活跃顶点
-        cudaMemcpy(h_active, d_active, num_nodes*sizeof(int), cudaMemcpyDeviceToHost);
-        active_nodes = count_active_nodes(h_active, num_nodes);
-        if(active_nodes == 0) break;
 
         // 执行拉模式核函数
         ccPullKernel<<<num_blocks, BLOCK_SIZE>>>(
@@ -114,6 +117,13 @@ void ccGPU(
         // 更新下一轮活跃数组
         cudaMemcpy(d_active, d_update, num_nodes*sizeof(int), cudaMemcpyDeviceToDevice);
         cudaMemset(d_update, 0, num_nodes*sizeof(int));
+
+        // GPU 统计下一轮活跃顶点数，CPU 只回传一个 int
+        cudaMemset(d_num_active, 0, sizeof(int));
+        countActiveKernel<<<num_blocks, BLOCK_SIZE>>>(
+            d_active, d_num_active, num_nodes
+        );
+        cudaMemcpy(&active_nodes, d_num_active, sizeof(int), cudaMemcpyDeviceToHost);
 
     }
 
@@ -132,6 +142,7 @@ void ccGPU(
     cudaFree(d_values); cudaFree(d_row_offsets); cudaFree(d_column_indices);
     cudaFree(d_column_offsets); cudaFree(d_row_indices);
     cudaFree(d_active); cudaFree(d_update);
+    cudaFree(d_num_active);
     free(h_active); 
 
     //printf("GPU CC finished in %d iterations.\n", iter);
