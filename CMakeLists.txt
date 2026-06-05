@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 project(GraphAlgorithm LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(MPI REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,6 +55,11 @@ function(add_graph_nccl_executable target algorithm)
         BUILD_RPATH "${NCCL_ROOT}/lib"
         INSTALL_RPATH "${NCCL_ROOT}/lib"
     )
+endfunction()
+
+function(add_graph_mpi_nccl_executable target algorithm)
+    add_graph_nccl_executable(${target} ${algorithm} ${ARGN})
+    target_link_libraries(${target} PRIVATE MPI::MPI_CXX)
 endfunction()
 
 add_subdirectory(algorithms/bfs)

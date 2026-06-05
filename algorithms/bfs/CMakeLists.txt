@@ -4,7 +4,7 @@ add_graph_cuda_executable(bfs_cub bfs tolerance_cub/bfs_tolerance_cub.cu)
 add_graph_cuda_executable(bfs_threshold bfs tolerance_threshold/bfs_tolerance_threshold.cu)
 add_graph_cuda_executable(bfs_queue bfs tolerance_queue/bfs_tolerance_queue.cu)
 add_graph_cuda_executable(bfs_compact_queue bfs tolerance_compact_queue/bfs_tolerance_compact_queue.cu)
-add_graph_nccl_executable(bfs_multiGPU bfs multigpu/bfs_tolerance_multiGPU.cu)
+add_graph_mpi_nccl_executable(bfs_multiGPU bfs multigpu/bfs_tolerance_multiGPU.cu)
 
 target_link_libraries(bfs_threshold PRIVATE CUDA::nvToolsExt)
 target_link_libraries(bfs_queue PRIVATE CUDA::nvToolsExt)

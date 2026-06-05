@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <nvToolsExt.h>
+#include <mpi.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,9 +20,12 @@
 #include <thread>
 #include <unordered_map>
 
+#include "include/spsc_queue.h"
+
 #define BLOCK_SIZE 256
 #define INF 100000
 #define MAX_GPUS 8
+#define CHECK_BUFFER_COUNT 64
 
 // ==================== 数据结构 ====================
 enum ValueTrend { TREND_NONE = 0, TREND_INC = 1, TREND_DEC = 2 };
@@ -29,18 +33,21 @@ enum ValueTrend { TREND_NONE = 0, TREND_INC = 1, TREND_DEC = 2 };
 struct MonotonicInfo {
     int dmr_error_flag;
     int monotonic_error_flag;
-};
-
-struct AsyncCheckWorkerState {
-    std::atomic<bool> stop{false};
+    unsigned long long sum_abs_delta;
+    int count_update;
 };
 
 struct AsyncCheckResult {
     bool done = false;
-    long long sum_delta = 0;
+    unsigned long long sum_abs_delta = 0;
     int count_update = 0;
     int dmr_error = 0;
     int monotonic_error = 0;
+};
+
+struct CheckTask {
+    int iter = 0;
+    int buf = -1;
 };
 
 struct NvtxRange {
@@ -91,7 +98,7 @@ __global__ void bfsPullDualMultiGPUKernel(
     const int* d_column_offsets, const int* d_row_indices,
     const int* d_active, int* d_update,
     int owned_count, int local_node_count,
-    int* d_delta, MonotonicInfo* d_info, ValueTrend trend
+    MonotonicInfo* d_info, ValueTrend trend
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;   // local owned id
     int local_tid = threadIdx.x;
@@ -175,15 +182,15 @@ __global__ void bfsPullDualMultiGPUKernel(
                 }
             }
             int delta = main_newVal - oldVal;
-            d_delta[tid] = delta;
+            unsigned long long abs_delta = (delta < 0)
+                ? (unsigned long long)(-(long long)delta)
+                : (unsigned long long)delta;
+            atomicAdd(&(d_info->sum_abs_delta), abs_delta);
+            atomicAdd(&(d_info->count_update), 1);
             if ((trend == TREND_INC && delta < 0) || (trend == TREND_DEC && delta > 0)) {
                 atomicExch(&(d_info->monotonic_error_flag), 1);
             }
-        } else {
-            d_delta[tid] = 0;
         }
-    } else if (valid_tid) {
-        d_delta[tid] = 0;
     }
 }
 
@@ -402,7 +409,7 @@ inline void alloc_int_buffer(int** d_ptr, int n) {
     CUDA_CHECK(cudaMalloc(d_ptr, n * sizeof(int)));
 }
 
-// ==================== 主函数：局部子图 + Ghost 节点 + NCCL 点对点通信 ====================
+// ==================== 主函数：MPI rank + Ghost 节点 + NCCL 点对点通信 ====================
 inline void bfsMultiGPU(
     int* h_value,
     const int* h_row_offsets, const int* h_column_indices,
@@ -414,342 +421,271 @@ inline void bfsMultiGPU(
 ) {
     (void)num_edges;
 
-    int num_gpus = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
-    if (num_gpus <= 0) {
-        fprintf(stderr, "没有可用 GPU。\n");
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (!mpi_initialized) {
+        fprintf(stderr, "bfsMultiGPU 需要先调用 MPI_Init。\n");
         exit(EXIT_FAILURE);
     }
-    if (num_gpus > MAX_GPUS) num_gpus = MAX_GPUS;
 
-    int nodes_per_gpu = (num_nodes + num_gpus - 1) / num_gpus;
-    int max_outdegree = compute_max_outdegree(h_row_offsets, num_nodes);
-
-    printf("发现 %d 个 GPU，开启 NCCL 子图划分 BFS：owned + ghost + send/recv activation/value。\n", num_gpus);
-
-    std::vector<int> devs(num_gpus);
-    std::iota(devs.begin(), devs.end(), 0);
-    std::vector<ncclComm_t> comms(num_gpus);
-    NCCL_CHECK(ncclCommInitAll(comms.data(), num_gpus, devs.data()));
-
-    // 1) 构造每张 GPU 的 owned + ghost 子图。
-    std::vector<GpuSubgraphHost> parts(num_gpus);
-    for (int d = 0; d < num_gpus; ++d) {
-        build_vertex_partition_subgraph(
-            d, num_gpus, num_nodes, nodes_per_gpu,
-            h_row_offsets, h_column_indices, h_column_offsets, h_row_indices,
-            parts[d]
-        );
-        printf("GPU %d: owned [%d, %d), owned_count=%d, local_count=%d, ghosts=%zu\n",
-               d, parts[d].start_node, parts[d].end_node,
-               parts[d].owned_count, parts[d].local_node_count, parts[d].ghost_local_ids.size());
+    int world_rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (world_size <= 0) {
+        fprintf(stderr, "MPI world_size 非法。\n");
+        exit(EXIT_FAILURE);
     }
 
-    // 2) 生成通信计划。
-    std::vector<std::vector<PeerPlanHost>> h_plan(num_gpus, std::vector<PeerPlanHost>(num_gpus));
-    for (int sender = 0; sender < num_gpus; ++sender) {
+    MPI_Comm local_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, world_rank, MPI_INFO_NULL, &local_comm);
+    int local_rank = 0;
+    int local_size = 1;
+    MPI_Comm_rank(local_comm, &local_rank);
+    MPI_Comm_size(local_comm, &local_size);
+
+    int local_device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&local_device_count));
+    if (local_device_count <= 0) {
+        fprintf(stderr, "rank %d: 当前 host 没有可用 GPU。\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    int device_id = local_rank % local_device_count;
+    CUDA_CHECK(cudaSetDevice(device_id));
+
+    ncclUniqueId nccl_id;
+    if (world_rank == 0) {
+        NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+    }
+    MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    ncclComm_t comm;
+    NCCL_CHECK(ncclCommInitRank(&comm, world_size, nccl_id, world_rank));
+
+    int nodes_per_rank = (num_nodes + world_size - 1) / world_size;
+    int max_outdegree = compute_max_outdegree(h_row_offsets, num_nodes);
+
+    if (world_rank == 0) {
+        printf("发现 %d 个 MPI rank，开启 NCCL 分布式 BFS：每 rank 绑定一张 GPU，owned + ghost + send/recv activation/value。\n", world_size);
+    }
+
+    // 每个 rank 都构造全局 host 侧划分，用于生成对等通信计划；device 侧只上传本 rank 的子图。
+    std::vector<GpuSubgraphHost> parts(world_size);
+    for (int r = 0; r < world_size; ++r) {
+        build_vertex_partition_subgraph(
+            r, world_size, num_nodes, nodes_per_rank,
+            h_row_offsets, h_column_indices, h_column_offsets, h_row_indices,
+            parts[r]
+        );
+        if (world_rank == 0) {
+            printf("Rank %d: owned [%d, %d), owned_count=%d, local_count=%d, ghosts=%zu\n",
+                   r, parts[r].start_node, parts[r].end_node,
+                   parts[r].owned_count, parts[r].local_node_count,
+                   parts[r].ghost_local_ids.size());
+        }
+    }
+    const auto& part = parts[world_rank];
+
+    std::vector<std::vector<PeerPlanHost>> h_plan(world_size, std::vector<PeerPlanHost>(world_size));
+    for (int sender = 0; sender < world_size; ++sender) {
         const auto& sp = parts[sender];
         for (size_t k = 0; k < sp.ghost_local_ids.size(); ++k) {
             int ghost_local = sp.ghost_local_ids[k];
             int ghost_global = sp.ghost_global_ids[k];
-            int owner = owner_of_vertex(ghost_global, nodes_per_gpu, num_gpus);
+            int owner = owner_of_vertex(ghost_global, nodes_per_rank, world_size);
             if (owner == sender) continue;
 
             auto it = parts[owner].global_to_local.find(ghost_global);
             if (it == parts[owner].global_to_local.end()) continue;
-            int owner_local = it->second;  // owned local id on owner GPU
+            int owner_local = it->second;
 
-            // activation: sender d_update[ghost] -> owner d_next_active[owned]
             h_plan[sender][owner].act_send_local.push_back(ghost_local);
             h_plan[owner][sender].act_recv_owned.push_back(owner_local);
-
-            // value sync: owner d_values[owned] -> sender d_values[ghost]
             h_plan[owner][sender].value_send_owned.push_back(owner_local);
             h_plan[sender][owner].value_recv_ghost.push_back(ghost_local);
         }
     }
 
-    // 3) 初始化 host active / values。
     for (int i = 0; i < num_nodes; ++i) h_value[i] = INF;
     h_value[src] = 0;
 
     int* h_active_global = nullptr;
     CUDA_CHECK(cudaMallocHost(&h_active_global, num_nodes * sizeof(int)));
     for (int i = 0; i < num_nodes; ++i) h_active_global[i] = -1;
-
-    // pull 版本：source 自身不一定会产生变小，所以第一轮激活 source 的出邻居。
     h_active_global[src] = 1;
     for (int e = h_row_offsets[src]; e < h_row_offsets[src + 1]; ++e) {
         int dst = h_column_indices[e];
         if (dst >= 0 && dst < num_nodes) h_active_global[dst] = 1;
     }
-    // 4) Device 资源。
-    std::vector<int*> d_values(num_gpus, nullptr), d_active(num_gpus, nullptr);
-    std::vector<int*> d_next_active(num_gpus, nullptr), d_update(num_gpus, nullptr);
-    std::vector<int*> d_row_offsets(num_gpus, nullptr), d_column_indices(num_gpus, nullptr);
-    std::vector<int*> d_column_offsets(num_gpus, nullptr), d_row_indices(num_gpus, nullptr);
-    std::vector<std::vector<int*>> d_delta(num_gpus, std::vector<int*>(2, nullptr));
-    std::vector<int*> d_delta_scratch(num_gpus, nullptr);
-    std::vector<int*> d_num_active(num_gpus, nullptr);
-    std::vector<int> h_num_active(num_gpus, 0);
-    std::vector<std::vector<MonotonicInfo*>> d_info(num_gpus, std::vector<MonotonicInfo*>(2, nullptr));
-    std::vector<MonotonicInfo*> d_info_scratch(num_gpus, nullptr);
-    std::vector<cudaStream_t> streams(num_gpus);
-    std::vector<cudaStream_t> check_streams(num_gpus);
-    std::vector<std::vector<PeerPlanDevice>> d_plan(num_gpus, std::vector<PeerPlanDevice>(num_gpus));
 
-    std::vector<std::vector<int*>> h_delta(num_gpus, std::vector<int*>(2, nullptr));
-    std::vector<std::vector<MonotonicInfo*>> h_info(num_gpus, std::vector<MonotonicInfo*>(2, nullptr));
-    std::vector<std::vector<cudaEvent_t>> compute_done_events(num_gpus, std::vector<cudaEvent_t>(2));
-    std::vector<std::vector<cudaEvent_t>> check_events(num_gpus, std::vector<cudaEvent_t>(2));
-    std::vector<std::unique_ptr<AsyncCheckWorkerState>> check_states(num_gpus);
-    std::unique_ptr<std::atomic<int>[]> pending_check(new std::atomic<int>[num_gpus * 2]);
-    for (int i = 0; i < num_gpus * 2; ++i) pending_check[i].store(0);
-    auto pending_index = [](int d, int buf) { return d * 2 + buf; };
+    int local_alloc_count = std::max(1, part.local_node_count);
+    int owned_alloc_count = std::max(1, part.owned_count);
 
-    std::vector<std::thread> check_workers;
-    std::vector<std::vector<AsyncCheckResult>> check_results(1001, std::vector<AsyncCheckResult>(num_gpus));
-    std::mutex check_results_mutex;
-    std::atomic<int> max_dispatched_check_iter(0);
-    std::atomic<bool> detected_dmr(false);
-    std::atomic<bool> detected_monotonic(false);
-    std::atomic<bool> detected_avg_increase(false);
-    int first_dmr_iter = -1;
-    int first_monotonic_iter = -1;
-    int first_avg_increase_iter = -1;
-    int next_check_iter_to_aggregate = 1;
-    float previous_avg_delta = (float)INF;
+    int *d_values = nullptr, *d_active = nullptr, *d_next_active = nullptr, *d_update = nullptr;
+    int *d_row_offsets = nullptr, *d_column_indices = nullptr;
+    int *d_column_offsets = nullptr, *d_row_indices = nullptr;
+    int *d_num_active = nullptr;
+    MonotonicInfo* d_info_scratch = nullptr;
+    std::vector<MonotonicInfo*> d_info(CHECK_BUFFER_COUNT, nullptr);
+    std::vector<MonotonicInfo*> h_info(CHECK_BUFFER_COUNT, nullptr);
+    std::vector<cudaEvent_t> compute_done_events(CHECK_BUFFER_COUNT);
+    std::vector<cudaEvent_t> check_events(CHECK_BUFFER_COUNT);
 
-    for (int d = 0; d < num_gpus; ++d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        const auto& p = parts[d];
-        CUDA_CHECK(cudaStreamCreate(&streams[d]));
-        CUDA_CHECK(cudaStreamCreate(&check_streams[d]));
-
-        int local_alloc_count = std::max(1, p.local_node_count);
-        int owned_alloc_count = std::max(1, p.owned_count);
-
-        CUDA_CHECK(cudaMalloc(&d_values[d], local_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_active[d], owned_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_next_active[d], owned_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_update[d], local_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_row_offsets[d], (p.owned_count + 1) * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_column_offsets[d], (p.owned_count + 1) * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_column_indices[d], p.column_indices.size() * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_row_indices[d], p.row_indices.size() * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_delta_scratch[d], owned_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_num_active[d], sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_info_scratch[d], sizeof(MonotonicInfo)));
-        for (int b = 0; b < 2; ++b) {
-            CUDA_CHECK(cudaMalloc(&d_delta[d][b], owned_alloc_count * sizeof(int)));
-            CUDA_CHECK(cudaMalloc(&d_info[d][b], sizeof(MonotonicInfo)));
-            CUDA_CHECK(cudaMallocHost(&h_delta[d][b], owned_alloc_count * sizeof(int)));
-            CUDA_CHECK(cudaMallocHost(&h_info[d][b], sizeof(MonotonicInfo)));
-            CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_events[d][b], cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&check_events[d][b], cudaEventDisableTiming));
-        }
-        check_states[d].reset(new AsyncCheckWorkerState());
-
-        std::vector<int> h_local_values(local_alloc_count, INF);
-        std::vector<int> h_local_active(owned_alloc_count, -1);
-        for (int local = 0; local < p.local_node_count; ++local) {
-            int global = p.local_to_global[local];
-            h_local_values[local] = h_value[global];
-        }
-        for (int local = 0; local < p.owned_count; ++local) {
-            int global = p.start_node + local;
-            h_local_active[local] = h_active_global[global];
-        }
-
-        CUDA_CHECK(cudaMemcpy(d_values[d], h_local_values.data(), local_alloc_count * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_active[d], h_local_active.data(), owned_alloc_count * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(d_update[d], 0xff, local_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_next_active[d], 0xff, owned_alloc_count * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(d_row_offsets[d], p.row_offsets.data(), (p.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_column_offsets[d], p.column_offsets.data(), (p.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_column_indices[d], p.column_indices.data(), p.column_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_row_indices[d], p.row_indices.data(), p.row_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
-
-        // 初始 active 也直接在本 GPU 上按阈值标记 critical，不再回 CPU 做 topK。
-        CUDA_CHECK(cudaMemsetAsync(d_num_active[d], 0, sizeof(int), streams[d]));
-        if (p.owned_count > 0) {
-            int blocks = (p.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            scoreAndMarkKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                d_active[d], d_row_offsets[d], p.owned_count, max_outdegree,
-                alpha, beta, threshold, d_num_active[d]
-            );
-            CUDA_CHECK(cudaGetLastError());
-        }
-
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& hp = h_plan[d][peer];
-            auto& dp = d_plan[d][peer];
-            dp.act_send_count = (int)hp.act_send_local.size();
-            dp.act_recv_count = (int)hp.act_recv_owned.size();
-            dp.value_send_count = (int)hp.value_send_owned.size();
-            dp.value_recv_count = (int)hp.value_recv_ghost.size();
-
-            upload_index_vector(hp.act_send_local, &dp.d_act_send_local);
-            upload_index_vector(hp.act_recv_owned, &dp.d_act_recv_owned);
-            upload_index_vector(hp.value_send_owned, &dp.d_value_send_owned);
-            upload_index_vector(hp.value_recv_ghost, &dp.d_value_recv_ghost);
-
-            alloc_int_buffer(&dp.d_act_send_buf, dp.act_send_count);
-            alloc_int_buffer(&dp.d_act_recv_buf, dp.act_recv_count);
-            alloc_int_buffer(&dp.d_value_send_buf, dp.value_send_count);
-            alloc_int_buffer(&dp.d_value_recv_buf, dp.value_recv_count);
-        }
+    CUDA_CHECK(cudaMalloc(&d_values, local_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_active, owned_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_next_active, owned_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_update, local_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_row_offsets, (part.owned_count + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_column_offsets, (part.owned_count + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_column_indices, part.column_indices.size() * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_row_indices, part.row_indices.size() * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_num_active, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_info_scratch, sizeof(MonotonicInfo)));
+    for (int b = 0; b < CHECK_BUFFER_COUNT; ++b) {
+        CUDA_CHECK(cudaMalloc(&d_info[b], sizeof(MonotonicInfo)));
+        CUDA_CHECK(cudaMallocHost(&h_info[b], sizeof(MonotonicInfo)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_events[b], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&check_events[b], cudaEventDisableTiming));
     }
 
-    auto try_aggregate_checks = [&]() {
-        std::lock_guard<std::mutex> lock(check_results_mutex);
-        int dispatched = max_dispatched_check_iter.load();
-        while (next_check_iter_to_aggregate <= dispatched) {
-            bool all_done = true;
-            for (int d = 0; d < num_gpus; ++d) {
-                if (!check_results[next_check_iter_to_aggregate][d].done) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (!all_done) break;
+    std::vector<int> h_local_values(local_alloc_count, INF);
+    std::vector<int> h_local_active(owned_alloc_count, -1);
+    for (int local = 0; local < part.local_node_count; ++local) {
+        int global = part.local_to_global[local];
+        h_local_values[local] = h_value[global];
+    }
+    for (int local = 0; local < part.owned_count; ++local) {
+        int global = part.start_node + local;
+        h_local_active[local] = h_active_global[global];
+    }
 
-            long long sum_delta = 0;
-            int count_update = 0;
-            bool iter_dmr = false;
-            bool iter_monotonic = false;
-            for (int d = 0; d < num_gpus; ++d) {
-                const auto& r = check_results[next_check_iter_to_aggregate][d];
-                sum_delta += r.sum_delta;
-                count_update += r.count_update;
-                iter_dmr = iter_dmr || (r.dmr_error != 0);
-                iter_monotonic = iter_monotonic || (r.monotonic_error != 0);
-            }
+    CUDA_CHECK(cudaMemcpy(d_values, h_local_values.data(), local_alloc_count * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_active, h_local_active.data(), owned_alloc_count * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_update, 0xff, local_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_next_active, 0xff, owned_alloc_count * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_row_offsets, part.row_offsets.data(), (part.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_column_offsets, part.column_offsets.data(), (part.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_column_indices, part.column_indices.data(), part.column_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_row_indices, part.row_indices.data(), part.row_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
 
-            if (iter_dmr) {
-                detected_dmr.store(true);
-                if (first_dmr_iter < 0) first_dmr_iter = next_check_iter_to_aggregate;
-            }
-            if (iter_monotonic) {
-                detected_monotonic.store(true);
-                if (first_monotonic_iter < 0) first_monotonic_iter = next_check_iter_to_aggregate;
-            }
-            if (count_update > 0) {
-                float avg_delta = std::fabs((float)sum_delta) / (float)count_update;
-                if (avg_delta > previous_avg_delta) {
-                    detected_avg_increase.store(true);
-                    if (first_avg_increase_iter < 0) first_avg_increase_iter = next_check_iter_to_aggregate;
-                }
-                previous_avg_delta = avg_delta;
-            }
-            ++next_check_iter_to_aggregate;
-        }
-    };
+    cudaStream_t stream, check_stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&check_stream, cudaStreamNonBlocking));
 
-    auto try_reserve_check_slot = [&](int d, int buf, int iter_id) {
-        int expected = 0;
-        if (!pending_check[pending_index(d, buf)].compare_exchange_strong(expected, -1)) {
-            check_results[iter_id][d].done = true;
-            return false;
-        }
-        return true;
-    };
+    CUDA_CHECK(cudaMemsetAsync(d_num_active, 0, sizeof(int), stream));
+    if (part.owned_count > 0) {
+        int blocks = (part.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        scoreAndMarkKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+            d_active, d_row_offsets, part.owned_count, max_outdegree,
+            alpha, beta, threshold, d_num_active
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
 
-    check_workers.reserve(num_gpus);
-    for (int d = 0; d < num_gpus; ++d) {
-        check_workers.emplace_back([&, d]() {
-            CUDA_CHECK(cudaSetDevice(d));
-            const int owned_count = parts[d].owned_count;
-            while (!check_states[d]->stop.load()) {
-                bool did_work = false;
-                for (int buf = 0; buf < 2; ++buf) {
-                    int iter_id = pending_check[pending_index(d, buf)].load();
-                    if (iter_id <= 0) continue;
+    std::vector<PeerPlanDevice> d_plan(world_size);
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == world_rank) continue;
+        auto& hp = h_plan[world_rank][peer];
+        auto& dp = d_plan[peer];
+        dp.act_send_count = (int)hp.act_send_local.size();
+        dp.act_recv_count = (int)hp.act_recv_owned.size();
+        dp.value_send_count = (int)hp.value_send_owned.size();
+        dp.value_recv_count = (int)hp.value_recv_ghost.size();
 
-                    cudaError_t event_status = cudaEventQuery(check_events[d][buf]);
-                    if (event_status == cudaErrorNotReady) continue;
-                    CUDA_CHECK(event_status);
-                    did_work = true;
+        upload_index_vector(hp.act_send_local, &dp.d_act_send_local);
+        upload_index_vector(hp.act_recv_owned, &dp.d_act_recv_owned);
+        upload_index_vector(hp.value_send_owned, &dp.d_value_send_owned);
+        upload_index_vector(hp.value_recv_ghost, &dp.d_value_recv_ghost);
 
-                    NvtxRange scan_range(nvtx_name("worker CPU scan", iter_id, d));
-                    long long sum_delta = 0;
-                    int count_update = 0;
-                    for (int i = 0; i < owned_count; ++i) {
-                        int dv = h_delta[d][buf][i];
-                        if (dv != 0) {
-                            sum_delta += (long long)dv;
-                            ++count_update;
-                        }
+        alloc_int_buffer(&dp.d_act_send_buf, dp.act_send_count);
+        alloc_int_buffer(&dp.d_act_recv_buf, dp.act_recv_count);
+        alloc_int_buffer(&dp.d_value_send_buf, dp.value_send_count);
+        alloc_int_buffer(&dp.d_value_recv_buf, dp.value_recv_count);
+    }
+
+    SpscQueue<int, CHECK_BUFFER_COUNT> free_buffers;
+    SpscQueue<CheckTask, CHECK_BUFFER_COUNT> pending_tasks;
+    for (int b = 0; b < CHECK_BUFFER_COUNT; ++b) free_buffers.try_push(b);
+    std::atomic<bool> check_stop(false);
+    std::vector<AsyncCheckResult> check_results(1001);
+
+    std::thread check_worker([&]() {
+        CUDA_CHECK(cudaSetDevice(device_id));
+        while (!check_stop.load(std::memory_order_relaxed) || !pending_tasks.empty()) {
+            bool progressed = false;
+            CheckTask task;
+            if (pending_tasks.peek(task)) {
+                cudaError_t event_status = cudaEventQuery(check_events[task.buf]);
+                if (event_status == cudaSuccess) {
+                    pending_tasks.try_pop(task);
+                    NvtxRange scan_range(nvtx_name("worker CPU scan", task.iter, world_rank));
+
+                    AsyncCheckResult result;
+                    result.done = true;
+                    result.dmr_error = h_info[task.buf]->dmr_error_flag;
+                    result.monotonic_error = h_info[task.buf]->monotonic_error_flag;
+                    result.sum_abs_delta = h_info[task.buf]->sum_abs_delta;
+                    result.count_update = h_info[task.buf]->count_update;
+                    if (task.iter >= 0 && task.iter < (int)check_results.size()) {
+                        check_results[task.iter] = result;
                     }
-
-                    auto& r = check_results[iter_id][d];
-                    r.done = true;
-                    r.sum_delta = sum_delta;
-                    r.count_update = count_update;
-                    r.dmr_error = h_info[d][buf]->dmr_error_flag;
-                    r.monotonic_error = h_info[d][buf]->monotonic_error_flag;
-                    pending_check[pending_index(d, buf)].store(0);
-                }
-
-                if (!did_work) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    free_buffers.try_push(task.buf);
+                    progressed = true;
+                } else if (event_status != cudaErrorNotReady) {
+                    CUDA_CHECK(event_status);
                 }
             }
-        });
-    }
+            if (!progressed) std::this_thread::yield();
+        }
+    });
 
-    auto launch_pack_activation = [&](int d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& dp = d_plan[d][peer];
+    auto launch_pack_activation = [&]() {
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
             if (dp.act_send_count > 0) {
                 int blocks = (dp.act_send_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                packByIndexKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    d_update[d], dp.d_act_send_local, dp.d_act_send_buf, dp.act_send_count
+                packByIndexKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    d_update, dp.d_act_send_local, dp.d_act_send_buf, dp.act_send_count
                 );
             }
         }
     };
 
-    auto launch_apply_activation = [&](int d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& dp = d_plan[d][peer];
+    auto launch_apply_activation = [&]() {
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
             if (dp.act_recv_count > 0) {
                 int blocks = (dp.act_recv_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                applyActivationRecvKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    dp.d_act_recv_buf, dp.d_act_recv_owned, d_next_active[d], dp.act_recv_count
+                applyActivationRecvKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    dp.d_act_recv_buf, dp.d_act_recv_owned, d_next_active, dp.act_recv_count
                 );
             }
         }
     };
 
-    auto launch_pack_values = [&](int d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& dp = d_plan[d][peer];
+    auto launch_pack_values = [&]() {
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
             if (dp.value_send_count > 0) {
                 int blocks = (dp.value_send_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                packByIndexKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    d_values[d], dp.d_value_send_owned, dp.d_value_send_buf, dp.value_send_count
+                packByIndexKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    d_values, dp.d_value_send_owned, dp.d_value_send_buf, dp.value_send_count
                 );
             }
         }
     };
 
-    auto launch_unpack_values = [&](int d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& dp = d_plan[d][peer];
+    auto launch_unpack_values = [&]() {
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
             if (dp.value_recv_count > 0) {
                 int blocks = (dp.value_recv_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                unpackByIndexKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    dp.d_value_recv_buf, dp.d_value_recv_ghost, d_values[d], dp.value_recv_count
+                unpackByIndexKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    dp.d_value_recv_buf, dp.d_value_recv_ghost, d_values, dp.value_recv_count
                 );
             }
         }
@@ -757,17 +693,14 @@ inline void bfsMultiGPU(
 
     auto nccl_exchange_activation = [&]() {
         NCCL_CHECK(ncclGroupStart());
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            for (int peer = 0; peer < num_gpus; ++peer) {
-                if (peer == d) continue;
-                auto& dp = d_plan[d][peer];
-                if (dp.act_recv_count > 0) {
-                    NCCL_CHECK(ncclRecv(dp.d_act_recv_buf, dp.act_recv_count, ncclInt, peer, comms[d], streams[d]));
-                }
-                if (dp.act_send_count > 0) {
-                    NCCL_CHECK(ncclSend(dp.d_act_send_buf, dp.act_send_count, ncclInt, peer, comms[d], streams[d]));
-                }
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
+            if (dp.act_recv_count > 0) {
+                NCCL_CHECK(ncclRecv(dp.d_act_recv_buf, dp.act_recv_count, ncclInt, peer, comm, stream));
+            }
+            if (dp.act_send_count > 0) {
+                NCCL_CHECK(ncclSend(dp.d_act_send_buf, dp.act_send_count, ncclInt, peer, comm, stream));
             }
         }
         NCCL_CHECK(ncclGroupEnd());
@@ -775,32 +708,24 @@ inline void bfsMultiGPU(
 
     auto nccl_exchange_values = [&]() {
         NCCL_CHECK(ncclGroupStart());
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            for (int peer = 0; peer < num_gpus; ++peer) {
-                if (peer == d) continue;
-                auto& dp = d_plan[d][peer];
-                if (dp.value_recv_count > 0) {
-                    NCCL_CHECK(ncclRecv(dp.d_value_recv_buf, dp.value_recv_count, ncclInt, peer, comms[d], streams[d]));
-                }
-                if (dp.value_send_count > 0) {
-                    NCCL_CHECK(ncclSend(dp.d_value_send_buf, dp.value_send_count, ncclInt, peer, comms[d], streams[d]));
-                }
+        for (int peer = 0; peer < world_size; ++peer) {
+            if (peer == world_rank) continue;
+            auto& dp = d_plan[peer];
+            if (dp.value_recv_count > 0) {
+                NCCL_CHECK(ncclRecv(dp.d_value_recv_buf, dp.value_recv_count, ncclInt, peer, comm, stream));
+            }
+            if (dp.value_send_count > 0) {
+                NCCL_CHECK(ncclSend(dp.d_value_send_buf, dp.value_send_count, ncclInt, peer, comm, stream));
             }
         }
         NCCL_CHECK(ncclGroupEnd());
     };
 
-    // 初始 ghost value 同步：让 source=0 等初值能出现在需要它的 ghost cache 中。
-    for (int d = 0; d < num_gpus; ++d) launch_pack_values(d);
+    launch_pack_values();
     nccl_exchange_values();
-    for (int d = 0; d < num_gpus; ++d) launch_unpack_values(d);
-    for (int d = 0; d < num_gpus; ++d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        CUDA_CHECK(cudaStreamSynchronize(streams[d]));
-    }
+    launch_unpack_values();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    CUDA_CHECK(cudaSetDevice(0));
     cudaEvent_t start_evt, stop_evt;
     CUDA_CHECK(cudaEventCreate(&start_evt));
     CUDA_CHECK(cudaEventCreate(&stop_evt));
@@ -810,228 +735,211 @@ inline void bfsMultiGPU(
     while (iter < 1000) {
         ++iter;
 
-        // 1) 本地 owned 顶点计算，ghost 只读。
-        for (int d = 0; d < num_gpus; ++d) {
-            NvtxRange enqueue_range(nvtx_name("main enqueue bfs/check", iter, d));
-            const int check_buf = iter & 1;
-            const bool do_async_check = try_reserve_check_slot(d, check_buf, iter);
+        {
+            NvtxRange enqueue_range(nvtx_name("main enqueue bfs/check", iter, world_rank));
+            int check_buf = -1;
+            bool do_async_check = free_buffers.try_pop(check_buf);
+            MonotonicInfo* iter_info = do_async_check ? d_info[check_buf] : d_info_scratch;
 
-            CUDA_CHECK(cudaSetDevice(d));
-            const auto& p = parts[d];
-            int* iter_delta = do_async_check ? d_delta[d][check_buf] : d_delta_scratch[d];
-            MonotonicInfo* iter_info = do_async_check ? d_info[d][check_buf] : d_info_scratch[d];
+            CUDA_CHECK(cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), stream));
+            CUDA_CHECK(cudaMemsetAsync(d_update, 0xff, local_alloc_count * sizeof(int), stream));
+            CUDA_CHECK(cudaMemsetAsync(d_next_active, 0xff, owned_alloc_count * sizeof(int), stream));
 
-            CUDA_CHECK(cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), streams[d]));
-            CUDA_CHECK(cudaMemsetAsync(d_update[d], 0xff, std::max(1, p.local_node_count) * sizeof(int), streams[d]));
-            CUDA_CHECK(cudaMemsetAsync(d_next_active[d], 0xff, std::max(1, p.owned_count) * sizeof(int), streams[d]));
-
-            if (p.owned_count > 0) {
-                int blocks = (p.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                bfsPullDualMultiGPUKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    d_values[d], d_row_offsets[d], d_column_indices[d],
-                    d_column_offsets[d], d_row_indices[d],
-                    d_active[d], d_update[d],
-                    p.owned_count, p.local_node_count,
-                    iter_delta, iter_info, TREND_DEC
+            if (part.owned_count > 0) {
+                int blocks = (part.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                bfsPullDualMultiGPUKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    d_values, d_row_offsets, d_column_indices,
+                    d_column_offsets, d_row_indices,
+                    d_active, d_update,
+                    part.owned_count, part.local_node_count,
+                    iter_info, TREND_DEC
                 );
                 CUDA_CHECK(cudaGetLastError());
 
-                copyOwnedUpdateToNextActiveKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    d_update[d], d_next_active[d], p.owned_count
+                copyOwnedUpdateToNextActiveKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    d_update, d_next_active, part.owned_count
                 );
             }
 
             if (do_async_check) {
-                NvtxRange copy_enqueue_range(nvtx_name("main enqueue check_stream D2H", iter, d));
-                CUDA_CHECK(cudaEventRecord(compute_done_events[d][check_buf], streams[d]));
-                CUDA_CHECK(cudaStreamWaitEvent(check_streams[d], compute_done_events[d][check_buf], 0));
+                NvtxRange copy_enqueue_range(nvtx_name("main enqueue check_stream D2H", iter, world_rank));
+                CUDA_CHECK(cudaEventRecord(compute_done_events[check_buf], stream));
+                CUDA_CHECK(cudaStreamWaitEvent(check_stream, compute_done_events[check_buf], 0));
                 CUDA_CHECK(cudaMemcpyAsync(
-                    h_delta[d][check_buf],
-                    d_delta[d][check_buf],
-                    std::max(1, p.owned_count) * sizeof(int),
-                    cudaMemcpyDeviceToHost,
-                    check_streams[d]
-                ));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    h_info[d][check_buf],
-                    d_info[d][check_buf],
+                    h_info[check_buf],
+                    d_info[check_buf],
                     sizeof(MonotonicInfo),
                     cudaMemcpyDeviceToHost,
-                    check_streams[d]
+                    check_stream
                 ));
-                CUDA_CHECK(cudaEventRecord(check_events[d][check_buf], check_streams[d]));
-                pending_check[pending_index(d, check_buf)].store(iter);
-            }
-        }
-        int old_max_check_iter = max_dispatched_check_iter.load();
-        while (old_max_check_iter < iter &&
-               !max_dispatched_check_iter.compare_exchange_weak(old_max_check_iter, iter)) {}
-
-        // 2) 把 ghost 激活打包，通过 NCCL 发给对应 owner GPU。
-        {
-            NvtxRange range(nvtx_name("main NCCL activation", iter, -1));
-            for (int d = 0; d < num_gpus; ++d) launch_pack_activation(d);
-            nccl_exchange_activation();
-            for (int d = 0; d < num_gpus; ++d) launch_apply_activation(d);
-        }
-
-        // 3) 把本轮更新后的 owned values 同步给需要它的 ghost 节点。
-        {
-            NvtxRange range(nvtx_name("main NCCL values", iter, -1));
-            for (int d = 0; d < num_gpus; ++d) launch_pack_values(d);
-            nccl_exchange_values();
-            for (int d = 0; d < num_gpus; ++d) launch_unpack_values(d);
-        }
-
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            CUDA_CHECK(cudaStreamSynchronize(streams[d]));
-        }
-
-        // 4) 直接在每张 GPU 上对下一轮 active 做阈值筛选，标记普通/关键顶点。
-        {
-            NvtxRange range(nvtx_name("main score active", iter, -1));
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            const auto& p = parts[d];
-
-            CUDA_CHECK(cudaMemsetAsync(d_num_active[d], 0, sizeof(int), streams[d]));
-
-            if (p.owned_count > 0) {
-                int blocks = (p.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                scoreAndMarkKernel<<<blocks, BLOCK_SIZE, 0, streams[d]>>>(
-                    d_next_active[d], d_row_offsets[d], p.owned_count, max_outdegree,
-                    alpha, beta, threshold, d_num_active[d]
-                );
-                CUDA_CHECK(cudaGetLastError());
-            }
-        }
-        }
-
-        // 5) 只回收每张 GPU 的 active 计数，用于终止判断；不再回收 active 数组。
-        int total_active_nodes = 0;
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            CUDA_CHECK(cudaMemcpyAsync(
-                &h_num_active[d],
-                d_num_active[d],
-                sizeof(int),
-                cudaMemcpyDeviceToHost,
-                streams[d]
-            ));
-        }
-
-        {
-            NvtxRange range(nvtx_name("main active count sync", iter, -1));
-        for (int d = 0; d < num_gpus; ++d) {
-            CUDA_CHECK(cudaSetDevice(d));
-            CUDA_CHECK(cudaStreamSynchronize(streams[d]));
-            total_active_nodes += h_num_active[d];
-        }
-        }
-
-        if (total_active_nodes == 0) break;
-
-        // 6) 下一轮直接使用已经标记好的 d_next_active，交换指针即可。
-        for (int d = 0; d < num_gpus; ++d) {
-            std::swap(d_active[d], d_next_active[d]);
-        }
-
-    }
-
-    bool pending_checks_left = true;
-    while (pending_checks_left) {
-        pending_checks_left = false;
-        for (int d = 0; d < num_gpus; ++d) {
-            for (int buf = 0; buf < 2; ++buf) {
-                if (pending_check[pending_index(d, buf)].load() > 0) {
-                    pending_checks_left = true;
+                CUDA_CHECK(cudaEventRecord(check_events[check_buf], check_stream));
+                if (!pending_tasks.try_push({iter, check_buf})) {
+                    fprintf(stderr, "rank %d: 检测任务队列已满，跳过 iter=%d 的 CPU 检测。\n", world_rank, iter);
+                    CUDA_CHECK(cudaEventSynchronize(check_events[check_buf]));
+                    free_buffers.try_push(check_buf);
                 }
             }
         }
-        if (pending_checks_left) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+
+        {
+            NvtxRange range(nvtx_name("main NCCL activation", iter, -1));
+            launch_pack_activation();
+            nccl_exchange_activation();
+            launch_apply_activation();
+        }
+
+        {
+            NvtxRange range(nvtx_name("main NCCL values", iter, -1));
+            launch_pack_values();
+            nccl_exchange_values();
+            launch_unpack_values();
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        int local_active_nodes = 0;
+        {
+            NvtxRange range(nvtx_name("main score active", iter, world_rank));
+            CUDA_CHECK(cudaMemsetAsync(d_num_active, 0, sizeof(int), stream));
+            if (part.owned_count > 0) {
+                int blocks = (part.owned_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                scoreAndMarkKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                    d_next_active, d_row_offsets, part.owned_count, max_outdegree,
+                    alpha, beta, threshold, d_num_active
+                );
+                CUDA_CHECK(cudaGetLastError());
+            }
+            CUDA_CHECK(cudaMemcpyAsync(&local_active_nodes, d_num_active, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        int total_active_nodes = 0;
+        MPI_Allreduce(&local_active_nodes, &total_active_nodes, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        if (total_active_nodes == 0) break;
+
+        std::swap(d_active, d_next_active);
+    }
+
+    while (!pending_tasks.empty()) std::this_thread::yield();
+    check_stop.store(true, std::memory_order_release);
+    if (check_worker.joinable()) check_worker.join();
+
+    bool detected_dmr = false;
+    bool detected_monotonic = false;
+    bool detected_avg_increase = false;
+    int first_dmr_iter = -1;
+    int first_monotonic_iter = -1;
+    int first_avg_increase_iter = -1;
+    float previous_avg_delta = (float)INF;
+
+    for (int check_iter = 1; check_iter <= iter; ++check_iter) {
+        int local_done = check_results[check_iter].done ? 1 : 0;
+        int all_done = 0;
+        MPI_Allreduce(&local_done, &all_done, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        if (!all_done) continue;
+
+        unsigned long long local_sum = check_results[check_iter].sum_abs_delta;
+        unsigned long long global_sum = 0;
+        int local_count = check_results[check_iter].count_update;
+        int global_count = 0;
+        int local_dmr = check_results[check_iter].dmr_error ? 1 : 0;
+        int global_dmr = 0;
+        int local_monotonic = check_results[check_iter].monotonic_error ? 1 : 0;
+        int global_monotonic = 0;
+
+        MPI_Allreduce(&local_sum, &global_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_count, &global_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_dmr, &global_dmr, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_monotonic, &global_monotonic, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+
+        if (global_dmr) {
+            detected_dmr = true;
+            if (first_dmr_iter < 0) first_dmr_iter = check_iter;
+        }
+        if (global_monotonic) {
+            detected_monotonic = true;
+            if (first_monotonic_iter < 0) first_monotonic_iter = check_iter;
+        }
+        if (global_count > 0) {
+            float avg_delta = (float)global_sum / (float)global_count;
+            if (previous_avg_delta < (float)INF && avg_delta > previous_avg_delta) {
+                detected_avg_increase = true;
+                if (first_avg_increase_iter < 0) first_avg_increase_iter = check_iter;
+            }
+            previous_avg_delta = avg_delta;
         }
     }
 
-    for (int d = 0; d < num_gpus; ++d) {
-        check_states[d]->stop.store(true);
-    }
-    for (auto& worker : check_workers) {
-        if (worker.joinable()) worker.join();
-    }
-    try_aggregate_checks();
-
-    // 6) 收集 owned values 回 host。
-    for (int d = 0; d < num_gpus; ++d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        const auto& p = parts[d];
-        if (p.owned_count <= 0) continue;
-        std::vector<int> h_owned_values(p.owned_count, INF);
-        CUDA_CHECK(cudaMemcpy(h_owned_values.data(), d_values[d], p.owned_count * sizeof(int), cudaMemcpyDeviceToHost));
-        for (int local = 0; local < p.owned_count; ++local) {
-            h_value[p.start_node + local] = h_owned_values[local];
-        }
+    std::vector<int> h_owned_values(part.owned_count, INF);
+    if (part.owned_count > 0) {
+        CUDA_CHECK(cudaMemcpy(h_owned_values.data(), d_values, part.owned_count * sizeof(int), cudaMemcpyDeviceToHost));
     }
 
-    CUDA_CHECK(cudaSetDevice(0));
+    std::vector<int> recv_counts(world_size), recv_displs(world_size);
+    for (int r = 0; r < world_size; ++r) {
+        recv_counts[r] = parts[r].owned_count;
+        recv_displs[r] = parts[r].start_node;
+    }
+    MPI_Allgatherv(
+        h_owned_values.data(), part.owned_count, MPI_INT,
+        h_value, recv_counts.data(), recv_displs.data(), MPI_INT,
+        MPI_COMM_WORLD
+    );
+
     CUDA_CHECK(cudaEventRecord(stop_evt));
     CUDA_CHECK(cudaEventSynchronize(stop_evt));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, start_evt, stop_evt));
-    printf("GPU time: %.4f ms\n", ms);
-    printf("NCCL 子图划分 BFS 迭代 %d 次正常结束。\n", iter);
-    printf("异步检测标记: DMR=%d", detected_dmr.load() ? 1 : 0);
-    if (first_dmr_iter >= 0) printf("(first_iter=%d)", first_dmr_iter);
-    printf(", monotonic=%d", detected_monotonic.load() ? 1 : 0);
-    if (first_monotonic_iter >= 0) printf("(first_iter=%d)", first_monotonic_iter);
-    printf(", avg_delta_increase=%d", detected_avg_increase.load() ? 1 : 0);
-    if (first_avg_increase_iter >= 0) printf("(first_iter=%d)", first_avg_increase_iter);
-    printf("\n");
+    float max_ms = 0.0f;
+    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // 7) 释放资源。
-    for (int d = 0; d < num_gpus; ++d) {
-        CUDA_CHECK(cudaSetDevice(d));
-        cudaFree(d_values[d]);
-        cudaFree(d_active[d]);
-        cudaFree(d_next_active[d]);
-        cudaFree(d_update[d]);
-        cudaFree(d_row_offsets[d]);
-        cudaFree(d_column_indices[d]);
-        cudaFree(d_column_offsets[d]);
-        cudaFree(d_row_indices[d]);
-        cudaFree(d_delta_scratch[d]);
-        cudaFree(d_num_active[d]);
-        cudaFree(d_info_scratch[d]);
-        for (int b = 0; b < 2; ++b) {
-            cudaFree(d_delta[d][b]);
-            cudaFree(d_info[d][b]);
-            cudaFreeHost(h_delta[d][b]);
-            cudaFreeHost(h_info[d][b]);
-            cudaEventDestroy(compute_done_events[d][b]);
-            cudaEventDestroy(check_events[d][b]);
-        }
-
-        for (int peer = 0; peer < num_gpus; ++peer) {
-            if (peer == d) continue;
-            auto& dp = d_plan[d][peer];
-            cudaFree(dp.d_act_send_local);
-            cudaFree(dp.d_act_recv_owned);
-            cudaFree(dp.d_value_send_owned);
-            cudaFree(dp.d_value_recv_ghost);
-            cudaFree(dp.d_act_send_buf);
-            cudaFree(dp.d_act_recv_buf);
-            cudaFree(dp.d_value_send_buf);
-            cudaFree(dp.d_value_recv_buf);
-        }
-        cudaStreamDestroy(check_streams[d]);
-        cudaStreamDestroy(streams[d]);
-        ncclCommDestroy(comms[d]);
+    if (world_rank == 0) {
+        printf("GPU time: %.4f ms\n", max_ms);
+        printf("NCCL 分布式 BFS 迭代 %d 次正常结束。\n", iter);
+        printf("异步检测标记: DMR=%d", detected_dmr ? 1 : 0);
+        if (first_dmr_iter >= 0) printf("(first_iter=%d)", first_dmr_iter);
+        printf(", monotonic=%d", detected_monotonic ? 1 : 0);
+        if (first_monotonic_iter >= 0) printf("(first_iter=%d)", first_monotonic_iter);
+        printf(", avg_delta_increase=%d", detected_avg_increase ? 1 : 0);
+        if (first_avg_increase_iter >= 0) printf("(first_iter=%d)", first_avg_increase_iter);
+        printf("\n");
     }
 
+    cudaFree(d_values);
+    cudaFree(d_active);
+    cudaFree(d_next_active);
+    cudaFree(d_update);
+    cudaFree(d_row_offsets);
+    cudaFree(d_column_indices);
+    cudaFree(d_column_offsets);
+    cudaFree(d_row_indices);
+    cudaFree(d_num_active);
+    cudaFree(d_info_scratch);
+    for (int b = 0; b < CHECK_BUFFER_COUNT; ++b) {
+        cudaFree(d_info[b]);
+        cudaFreeHost(h_info[b]);
+        cudaEventDestroy(compute_done_events[b]);
+        cudaEventDestroy(check_events[b]);
+    }
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == world_rank) continue;
+        auto& dp = d_plan[peer];
+        cudaFree(dp.d_act_send_local);
+        cudaFree(dp.d_act_recv_owned);
+        cudaFree(dp.d_value_send_owned);
+        cudaFree(dp.d_value_recv_ghost);
+        cudaFree(dp.d_act_send_buf);
+        cudaFree(dp.d_act_recv_buf);
+        cudaFree(dp.d_value_send_buf);
+        cudaFree(dp.d_value_recv_buf);
+    }
+    cudaStreamDestroy(check_stream);
+    cudaStreamDestroy(stream);
+    cudaEventDestroy(start_evt);
+    cudaEventDestroy(stop_evt);
     CUDA_CHECK(cudaFreeHost(h_active_global));
-    CUDA_CHECK(cudaEventDestroy(start_evt));
-    CUDA_CHECK(cudaEventDestroy(stop_evt));
+    ncclCommDestroy(comm);
+    MPI_Comm_free(&local_comm);
 }
 
 #endif // FAULT_TOLERANT_BFS_MULTIGPU_NCCL_PARTITIONED_CUH

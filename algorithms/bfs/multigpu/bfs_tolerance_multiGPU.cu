@@ -1,4 +1,5 @@
 #include "bfs_tolerance_multiGPU.cuh"
+#include <mpi.h>
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
@@ -64,6 +65,11 @@ void print_usage(const char* prog_name) {
 
 int main(int argc, char **argv)
 {
+    MPI_Init(&argc, &argv);
+    int world_rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     // --- 默认参数设置 ---
     float alpha = 0.5f;
     float beta = 0.5f;
@@ -79,9 +85,12 @@ int main(int argc, char **argv)
     // 我们约定：第一个非选项参数必须是数据集编号
     // 例如：./program 13356 -a 0.8
     if (argc < 2 || argv[1][0] == '-') {
-        fprintf(stderr, "错误: 必须在开头提供数据集编号!\n");
-        printf("用法: %s <数据集编号> [-a alpha] [-b beta] [-t threshold] [-s src]\n", argv[0]);
-        printf("示例: %s 13356 -a 0.7 -s 1\n", argv[0]);
+        if (world_rank == 0) {
+            fprintf(stderr, "错误: 必须在开头提供数据集编号!\n");
+            printf("用法: %s <数据集编号> [-a alpha] [-b beta] [-t threshold] [-s src]\n", argv[0]);
+            printf("示例: %s 13356 -a 0.7 -s 1\n", argv[0]);
+        }
+        MPI_Finalize();
         return 1;
     }
 
@@ -99,29 +108,39 @@ int main(int argc, char **argv)
             case 'b': beta = atof(optarg); break;
             case 't': threshold = atof(optarg); break;
             case 's': src = atoi(optarg); break;
-            case 'h': print_usage(argv[0]); return 0;
-            default:  print_usage(argv[0]); return 1;
+            case 'h':
+                if (world_rank == 0) print_usage(argv[0]);
+                MPI_Finalize();
+                return 0;
+            default:
+                if (world_rank == 0) print_usage(argv[0]);
+                MPI_Finalize();
+                return 1;
         }
     }
 
     // 打印参数确认信息
-    printf("加载数据集: %s\n", graph_file);
-    printf("参数配置: alpha=%.2f, beta=%.2f, threshold=%.2f, src=%d\n", alpha, beta, threshold, src);
+    if (world_rank == 0) {
+        printf("加载数据集: %s\n", graph_file);
+        printf("参数配置: alpha=%.2f, beta=%.2f, threshold=%.2f, src=%d, ranks=%d\n",
+               alpha, beta, threshold, src, world_size);
+    }
 
     CsrGraph csr_graph;
     bool undirected = false;
 
     if (BuildMarketGraph(graph_file, csr_graph, undirected) != 0) {
-        fprintf(stderr, "Failed to load graph.\n");
+        if (world_rank == 0) fprintf(stderr, "Failed to load graph.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
     }
 
     int* value = (int*)malloc(sizeof(int) * csr_graph.nodes);
     if (!value) {
-        fprintf(stderr, "malloc value failed.\n");
+        if (world_rank == 0) fprintf(stderr, "malloc value failed.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
     }
-    gpu_warmup();
     // 多 GPU 版本内部会 cudaGetDeviceCount，并对每张 GPU cudaSetDevice。
     // 所以这里不需要固定 cudaSetDevice(GPU_DEVICE)。
     bfsMultiGPU(value,
@@ -134,11 +153,12 @@ int main(int argc, char **argv)
                 src,
                 alpha,beta,threshold);
 
-    if (run_CPU) {
+    if (run_CPU && world_rank == 0) {
         int* ref_value = (int*)malloc(sizeof(int) * csr_graph.nodes);
         if (!ref_value) {
             fprintf(stderr, "malloc ref_value failed.\n");
             free(value);
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
             return 1;
         }
 
@@ -147,24 +167,19 @@ int main(int argc, char **argv)
         free(ref_value);
     }
 
-    FILE* f = fopen(outFileName.c_str(), "w");
-    if (f) {
-        for (int i = 0; i < csr_graph.nodes; i++) {
-            fprintf(f, "%d\n", value[i]);
+    if (world_rank == 0) {
+        FILE* f = fopen(outFileName.c_str(), "w");
+        if (f) {
+            for (int i = 0; i < csr_graph.nodes; i++) {
+                fprintf(f, "%d\n", value[i]);
+            }
+            fclose(f);
         }
-        fclose(f);
     }
 
     free(value);
 
-    // 多 GPU 程序里不建议只在当前 device 上 cudaDeviceReset。
-    // 测试程序可以逐个 reset。
-    int device_count = 0;
-    cudaGetDeviceCount(&device_count);
-    for (int d = 0; d < device_count; ++d) {
-        cudaSetDevice(d);
-        cudaDeviceReset();
-    }
-
+    cudaDeviceReset();
+    MPI_Finalize();
     return 0;
 }
