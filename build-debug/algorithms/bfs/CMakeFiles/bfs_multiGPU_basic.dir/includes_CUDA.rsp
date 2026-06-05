@@ -1,0 +1,1 @@
+-I/home/huangxy/Projects/GraphAlgorithm -I/home/huangxy/Projects/GraphAlgorithm/include -I/home/huangxy/software/nccl/include -isystem "/usr/local/cuda/targets/x86_64-linux/include" -isystem "/usr/lib/x86_64-linux-gnu/openmpi/include" -isystem "/usr/lib/x86_64-linux-gnu/openmpi/include/openmpi"

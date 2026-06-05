@@ -1,0 +1,1 @@
+-I/home/huangxy/Projects/GraphAlgorithm -I/home/huangxy/Projects/GraphAlgorithm/include -isystem "/usr/local/cuda/targets/x86_64-linux/include"
