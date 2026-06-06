@@ -25,9 +25,12 @@ dataset/flickr.mtx
 ```
 
 ## 构建
-
+**默认系统路径下已有MPI**
 ```bash
-cmake -S . -B build
+cmake \
+    -DNCCL_ROOT=xxx \
+    -S . \
+    -B build
 cmake --build build -j
 ```
 
@@ -225,6 +228,53 @@ ssh g2c14 'ln -sfn /workplace/home/huayunpeng/Projects/GraphAlgorithm /tmp/Graph
 ```
 
 更多 MPI/NCCL 排错细节见：`MPI_MULTIGPU_USAGE.md`。
+
+## 批量实验与画图
+
+批量实验脚本位于：
+
+```text
+scripts/experiments/run_benchmarks.py
+```
+
+推荐使用 conda 环境运行：
+
+```bash
+conda run -n test310 python scripts/experiments/run_benchmarks.py --datasets flickr --repeat 3
+```
+
+默认会运行 4 个算法的 4 类方法，并从输出中解析 `GPU time`，结果写入：
+
+```text
+outputs/experiments/<timestamp>/results.csv
+outputs/experiments/<timestamp>/logs/*.log
+```
+
+已有 CSV 用独立脚本画图：
+
+```bash
+conda run -n test310 python scripts/experiments/plot_results.py \
+  outputs/experiments/<timestamp>/results.csv
+```
+
+绘图脚本会按算法分别出图，并把耗时量级相近的数据集分到同一张图：
+
+```text
+outputs/experiments/<timestamp>/*_gpu_time_group*.png
+outputs/experiments/<timestamp>/plot_manifest.csv
+```
+
+BFS 的源点会自动从 `dataset/sources/<dataset>_sources.tsv` 里选择第一行的高度数顶点。更多用法见：`scripts/experiments/README.md`。
+
+## 脚本目录
+
+数据下载、格式转换、数据集统计和源点选择脚本位于：
+
+```text
+scripts/utils/
+```
+
+根目录 `utils` 保留为兼容软链接，指向 `scripts/utils`。
 
 ## 输出文件
 
