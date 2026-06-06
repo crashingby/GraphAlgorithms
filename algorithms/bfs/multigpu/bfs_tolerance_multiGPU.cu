@@ -8,6 +8,7 @@
 #include "include/graph.h"
 #include "include/warmup.cuh"
 #include "include/output.h"
+#include "include/cli_options.h"
 
 // 如果你把 bfsMultiGPU 放在 .cuh 里，就 include 对应头文件。
 // 如果暂时没有单独拆头文件，也可以直接 include 这个 .cu 做测试。
@@ -58,11 +59,6 @@ bool correctTest(int n, const int* ref, const int* gpu)
     return pass;
 }
 
-void print_usage(const char* prog_name) {
-    printf("Usage: %s [-a alpha] [-b beta] [-t threshold] [-g graph_file] [-s source_node]\n", prog_name);
-    printf("Defaults: alpha=0.5, beta=0.5, threshold=0.3, graph=dataset/13356.mtx, src=0\n");
-}
-
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
@@ -70,66 +66,18 @@ int main(int argc, char **argv)
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    // --- 默认参数设置 ---
-    float alpha = 0.5f;
-    float beta = 0.5f;
-    float threshold = 0.3f;
-    int src = 0;
-    std::string outFileName = graph_output_path("bfs", "info_outcome.txt");
-    const bool run_CPU = true;
-    
-    // 用于存放拼接后的路径
-    std::string graph_path; 
 
-    // --- 1. 处理位置参数 (数据集编号) ---
-    // 我们约定：第一个非选项参数必须是数据集编号
-    // 例如：./program 13356 -a 0.8
-    if (argc < 2 || argv[1][0] == '-') {
-        if (world_rank == 0) {
-            fprintf(stderr, "错误: 必须在开头提供数据集编号!\n");
-            printf("用法: %s <数据集编号> [-a alpha] [-b beta] [-t threshold] [-s src]\n", argv[0]);
-            printf("示例: %s 13356 -a 0.7 -s 1\n", argv[0]);
-        }
+    GraphCliOptions opts;
+    opts.run_cpu = true;
+    if (!graph_parse_cli(argc, argv, "bfs", opts, world_rank == 0)) {
         MPI_Finalize();
         return 1;
     }
-
-    // 自动拼接路径
-    graph_path = "dataset/" + std::string(argv[1]) + ".mtx";
-    const char* graph_file = graph_path.c_str();
-
-    // --- 2. 命令行选项解析 ---
-    // 注意：我们将 optind 设置为 2，跳过已经处理的数据集编号参数
-    int opt;
-    optind = 2; 
-    while ((opt = getopt(argc, argv, "a:b:t:s:h")) != -1) { // 删掉了 g:，因为改为自动拼接
-        switch (opt) {
-            case 'a': alpha = atof(optarg); break;
-            case 'b': beta = atof(optarg); break;
-            case 't': threshold = atof(optarg); break;
-            case 's': src = atoi(optarg); break;
-            case 'h':
-                if (world_rank == 0) print_usage(argv[0]);
-                MPI_Finalize();
-                return 0;
-            default:
-                if (world_rank == 0) print_usage(argv[0]);
-                MPI_Finalize();
-                return 1;
-        }
-    }
-
-    // 打印参数确认信息
-    if (world_rank == 0) {
-        printf("加载数据集: %s\n", graph_file);
-        printf("参数配置: alpha=%.2f, beta=%.2f, threshold=%.2f, src=%d, ranks=%d\n",
-               alpha, beta, threshold, src, world_size);
-    }
+    graph_print_config(opts, "bfs", "multigpu", true, false, true, world_rank == 0, world_size);
 
     CsrGraph csr_graph;
     bool undirected = false;
-
-    if (BuildMarketGraph(graph_file, csr_graph, undirected) != 0) {
+    if (BuildMarketGraph(opts.graph_path.c_str(), csr_graph, undirected) != 0) {
         if (world_rank == 0) fprintf(stderr, "Failed to load graph.\n");
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
@@ -141,8 +89,7 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
     }
-    // 多 GPU 版本内部会 cudaGetDeviceCount，并对每张 GPU cudaSetDevice。
-    // 所以这里不需要固定 cudaSetDevice(GPU_DEVICE)。
+
     bfsMultiGPU(value,
                 csr_graph.row_offsets,
                 csr_graph.column_indices,
@@ -150,10 +97,12 @@ int main(int argc, char **argv)
                 csr_graph.row_indices,
                 csr_graph.nodes,
                 csr_graph.edges,
-                src,
-                alpha,beta,threshold);
+                opts.src,
+                opts.alpha,
+                opts.beta,
+                opts.threshold);
 
-    if (run_CPU && world_rank == 0) {
+    if (opts.run_cpu && world_rank == 0) {
         int* ref_value = (int*)malloc(sizeof(int) * csr_graph.nodes);
         if (!ref_value) {
             fprintf(stderr, "malloc ref_value failed.\n");
@@ -161,24 +110,20 @@ int main(int argc, char **argv)
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
             return 1;
         }
-
-        bfsCPU(csr_graph, ref_value, src);
+        bfsCPU(csr_graph, ref_value, opts.src);
         correctTest(csr_graph.nodes, ref_value, value);
         free(ref_value);
     }
 
     if (world_rank == 0) {
-        FILE* f = fopen(outFileName.c_str(), "w");
+        FILE* f = fopen(graph_output_path("bfs", "info_outcome.txt").c_str(), "w");
         if (f) {
-            for (int i = 0; i < csr_graph.nodes; i++) {
-                fprintf(f, "%d\n", value[i]);
-            }
+            for (int i = 0; i < csr_graph.nodes; i++) fprintf(f, "%d\n", value[i]);
             fclose(f);
         }
     }
 
     free(value);
-
     cudaDeviceReset();
     MPI_Finalize();
     return 0;

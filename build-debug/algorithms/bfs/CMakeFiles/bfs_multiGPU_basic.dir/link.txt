@@ -1,1 +1,0 @@
-/usr/bin/g++ @CMakeFiles/bfs_multiGPU_basic.dir/objects1.rsp -o ../../bin/bfs/bfs_multiGPU_basic @CMakeFiles/bfs_multiGPU_basic.dir/linkLibs.rsp -L"/usr/local/cuda/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda/targets/x86_64-linux/lib"

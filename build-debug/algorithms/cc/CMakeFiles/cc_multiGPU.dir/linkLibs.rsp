@@ -1,1 +1,0 @@
- -Wl,-rpath,/home/huangxy/software/nccl/lib "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcudart.so" /home/huangxy/software/nccl/lib/libnccl.so "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libnvToolsExt.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

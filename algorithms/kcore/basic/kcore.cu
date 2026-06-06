@@ -5,6 +5,7 @@
 #include "kcore_gpu.cuh"
 #include "include/graph.h"
 #include "include/output.h"
+#include "include/cli_options.h"
 
 #define GPU_DEVICE 0
 
@@ -69,57 +70,47 @@ bool correctTest(int n, const int* ref, const int* gpu, int k)
 //-----------------------------
 // 主函数
 //-----------------------------
-int main(int argc, char **argv){
- 
-    const char graph_file[] = "dataset/7624.mtx";
+int main(int argc, char** argv)
+{
+    GraphCliOptions opts;
+    opts.run_cpu = false;
+    if (!graph_parse_cli(argc, argv, "kcore", opts)) return 1;
+    graph_print_config(opts, "kcore", "basic", false, true, false);
+
     std::string outFileName = graph_output_path("kcore", "info_outcome.txt");
-    const bool run_CPU = false;
-    int k = 5;
-  
     cudaSetDevice(GPU_DEVICE);
 
     CsrGraph csr_graph;
     bool undirected = false;
-    if (BuildMarketGraph(graph_file, csr_graph, undirected) != 0) {
+    if (BuildMarketGraph(opts.graph_path.c_str(), csr_graph, undirected) != 0) {
         fprintf(stderr, "Failed to load graph.\n");
         return 1;
     }
+
     int* value = (int*)malloc(sizeof(int) * csr_graph.nodes);
-
-    // GPU CC
     kcoreGPU(value,
-            csr_graph.row_offsets,
-            csr_graph.column_indices,
-            csr_graph.column_offsets,
-            csr_graph.row_indices,
-            csr_graph.nodes,
-            csr_graph.edges,
-            k); 
+             csr_graph.row_offsets,
+             csr_graph.column_indices,
+             csr_graph.column_offsets,
+             csr_graph.row_indices,
+             csr_graph.nodes,
+             csr_graph.edges,
+             opts.k);
 
-    // CPU 检查
-    if (run_CPU) {
+    if (opts.run_cpu) {
         int* ref_value = (int*)malloc(sizeof(int) * csr_graph.nodes);
-        kcoreCPU(csr_graph, ref_value, k);
-        correctTest(csr_graph.nodes, ref_value, value, k);
+        kcoreCPU(csr_graph, ref_value, opts.k);
+        correctTest(csr_graph.nodes, ref_value, value, opts.k);
         free(ref_value);
     }
 
-    // 输出结果
     FILE* f = fopen(outFileName.c_str(), "w");
     if (f) {
-        for (int i = 0; i < csr_graph.nodes; i++)
-            fprintf(f, "%d\n", value[i]);
+        for (int i = 0; i < csr_graph.nodes; i++) fprintf(f, "%d\n", value[i]);
         fclose(f);
     }
-    //     FILE* f = fopen(outFileName.c_str(), "w");
-    // if (f) {
-    //     for (int i = 0; i < csr_graph.nodes; i++)
-    //         fprintf(f, "%d\n", value[i] < k ? 0 : 1 );
-    //     fclose(f);
-    // }
 
-    
     free(value);
     cudaDeviceReset();
     return 0;
-  }
+}

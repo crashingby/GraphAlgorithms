@@ -1,19 +1,14 @@
 #include "kcore_tolerance_multiGPU.cuh"
 
+#include <mpi.h>
 #include <stdio.h>
 #include <cstdlib>
-#include <iostream>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 #include "include/graph.h"
 #include "include/output.h"
-
-void usage(const char* prog) {
-    printf("Usage: %s <dataset_id> [-k k] [-a alpha] [-b beta] [-t threshold] [-n]\n", prog);
-    printf("  -n  skip CPU correctness check\n");
-}
+#include "include/cli_options.h"
 
 void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     const int n = graph.nodes;
@@ -28,7 +23,6 @@ void kcoreCPU(const CsrGraph& graph, int* value, int k) {
         changed = false;
         for (int u = 0; u < n; ++u) {
             if (!alive[u] || value[u] >= k) continue;
-
             alive[u] = 0;
             changed = true;
             for (int e = graph.row_offsets[u]; e < graph.row_offsets[u + 1]; ++e) {
@@ -45,10 +39,7 @@ bool correctTest(int n, const int* ref, const int* gpu, int k) {
     for (int i = 0; i < n; ++i) {
         if (ref[i] == gpu[i]) continue;
         if (ref[i] < k && gpu[i] < k) continue;
-
-        if (nerr++ < 20) {
-            printf("Node %d: CPU %d, GPU %d\n", i, ref[i], gpu[i]);
-        }
+        if (nerr++ < 20) printf("Node %d: CPU %d, GPU %d\n", i, ref[i], gpu[i]);
         pass = false;
     }
     printf("CPU check: %s\n", pass ? "PASSED" : "FAILED");
@@ -56,45 +47,35 @@ bool correctTest(int n, const int* ref, const int* gpu, int k) {
 }
 
 int main(int argc, char** argv) {
-    float alpha = 0.5f;
-    float beta = 0.5f;
-    float threshold = 0.3f;
-    int k = 5;
-    bool run_cpu = true;
+    MPI_Init(&argc, &argv);
+    int rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    if (argc < 2 || argv[1][0] == '-') {
-        usage(argv[0]);
+    GraphCliOptions opts;
+    opts.run_cpu = true;
+    if (!graph_parse_cli(argc, argv, "kcore", opts, rank == 0)) {
+        MPI_Finalize();
         return 1;
     }
-
-    std::string graph_path = "dataset/" + std::string(argv[1]) + ".mtx";
-    optind = 2;
-
-    int opt;
-    while ((opt = getopt(argc, argv, "k:a:b:t:nh")) != -1) {
-        if (opt == 'k') k = atoi(optarg);
-        else if (opt == 'a') alpha = atof(optarg);
-        else if (opt == 'b') beta = atof(optarg);
-        else if (opt == 't') threshold = atof(optarg);
-        else if (opt == 'n') run_cpu = false;
-        else {
-            usage(argv[0]);
-            return opt == 'h' ? 0 : 1;
-        }
-    }
-
-    printf("加载数据集: %s\n", graph_path.c_str());
-    printf("参数配置: k=%d alpha=%.2f beta=%.2f threshold=%.2f CPU_check=%s\n",
-           k, alpha, beta, threshold, run_cpu ? "on" : "off");
+    graph_print_config(opts, "kcore", "multigpu", false, true, true, rank == 0, world_size);
 
     CsrGraph graph;
     bool undirected = false;
-    if (BuildMarketGraph(graph_path.c_str(), graph, undirected) != 0) {
-        fprintf(stderr, "Failed to load graph.\n");
+    if (BuildMarketGraph(opts.graph_path.c_str(), graph, undirected) != 0) {
+        if (rank == 0) fprintf(stderr, "Failed to load graph.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
     }
 
     int* value = (int*)malloc(sizeof(int) * graph.nodes);
+    if (!value) {
+        if (rank == 0) fprintf(stderr, "malloc value failed.\n");
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
+
     kcoreMultiGPU(value,
                   graph.row_offsets,
                   graph.column_indices,
@@ -102,31 +83,28 @@ int main(int argc, char** argv) {
                   graph.row_indices,
                   graph.nodes,
                   graph.edges,
-                  k,
-                  alpha,
-                  beta,
-                  threshold);
+                  opts.k,
+                  opts.alpha,
+                  opts.beta,
+                  opts.threshold);
 
-    if (run_cpu) {
+    if (opts.run_cpu && rank == 0) {
         int* ref = (int*)malloc(sizeof(int) * graph.nodes);
-        kcoreCPU(graph, ref, k);
-        correctTest(graph.nodes, ref, value, k);
+        kcoreCPU(graph, ref, opts.k);
+        correctTest(graph.nodes, ref, value, opts.k);
         free(ref);
     }
 
-    FILE* f = fopen(graph_output_path("kcore", "info_outcome.txt").c_str(), "w");
-    if (f) {
-        for (int i = 0; i < graph.nodes; ++i) fprintf(f, "%d\n", value[i]);
-        fclose(f);
+    if (rank == 0) {
+        FILE* f = fopen(graph_output_path("kcore", "info_outcome.txt").c_str(), "w");
+        if (f) {
+            for (int i = 0; i < graph.nodes; ++i) fprintf(f, "%d\n", value[i]);
+            fclose(f);
+        }
     }
 
     free(value);
-
-    int device_count = 0;
-    cudaGetDeviceCount(&device_count);
-    for (int d = 0; d < device_count; ++d) {
-        cudaSetDevice(d);
-        cudaDeviceReset();
-    }
+    cudaDeviceReset();
+    MPI_Finalize();
     return 0;
 }

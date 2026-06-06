@@ -9,11 +9,7 @@
 
 #include "include/graph.h"
 #include "include/output.h"
-
-void usage(const char* prog) {
-    printf("Usage: %s <dataset_id> [-k k] [-n]\n", prog);
-    printf("  -n  skip CPU correctness check\n");
-}
+#include "include/cli_options.h"
 
 void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     const int n = graph.nodes;
@@ -59,59 +55,31 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    int k = 5;
-    bool run_cpu = true;
-    if (argc < 2 || argv[1][0] == '-') {
-        if (rank == 0) usage(argv[0]);
+    GraphCliOptions opts;
+    opts.run_cpu = true;
+    if (!graph_parse_cli(argc, argv, "kcore", opts, rank == 0)) {
         MPI_Finalize();
         return 1;
     }
-
-    std::string graph_path = "dataset/" + std::string(argv[1]) + ".mtx";
-    optind = 2;
-    int opt = 0;
-    while ((opt = getopt(argc, argv, "k:nh")) != -1) {
-        if (opt == 'k') k = atoi(optarg);
-        else if (opt == 'n') run_cpu = false;
-        else {
-            if (rank == 0) usage(argv[0]);
-            MPI_Finalize();
-            return opt == 'h' ? 0 : 1;
-        }
-    }
-
-    if (rank == 0) {
-        printf("加载数据集: %s\n", graph_path.c_str());
-        printf("参数配置: k=%d, ranks=%d, CPU_check=%s\n",
-               k,
-               world_size,
-               run_cpu ? "on" : "off");
-    }
+    graph_print_config(opts, "kcore", "multigpu_basic", false, true, false, rank == 0, world_size);
 
     CsrGraph graph;
     bool undirected = false;
-    if (BuildMarketGraph(graph_path.c_str(), graph, undirected) != 0) {
+    if (BuildMarketGraph(opts.graph_path.c_str(), graph, undirected) != 0) {
         if (rank == 0) fprintf(stderr, "Failed to load graph.\n");
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         return 1;
     }
 
     int* value = (int*)malloc(sizeof(int) * graph.nodes);
-    kcoreMultiGPUBasic(
-        value,
-        graph.row_offsets,
-        graph.column_indices,
-        graph.column_offsets,
-        graph.row_indices,
-        graph.nodes,
-        graph.edges,
-        k
-    );
+    kcoreMultiGPUBasic(value, graph.row_offsets, graph.column_indices,
+                       graph.column_offsets, graph.row_indices,
+                       graph.nodes, graph.edges, opts.k);
 
-    if (run_cpu && rank == 0) {
+    if (opts.run_cpu && rank == 0) {
         int* ref = (int*)malloc(sizeof(int) * graph.nodes);
-        kcoreCPU(graph, ref, k);
-        correctTest(graph.nodes, ref, value, k);
+        kcoreCPU(graph, ref, opts.k);
+        correctTest(graph.nodes, ref, value, opts.k);
         free(ref);
     }
 
