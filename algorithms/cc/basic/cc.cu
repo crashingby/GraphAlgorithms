@@ -1,3 +1,7 @@
+/**
+ * @file cc.cu
+ * @brief CLI entry point and optional CPU oracle for single-GPU CC.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
@@ -12,6 +16,7 @@
 //-----------------------------
 // CPU CC 连通分量
 //-----------------------------
+/** @brief Run the CPU maximum-label reference iteration. */
 void ccCPU(const CsrGraph &graph, int* value)
 {
     const int n = graph.nodes;
@@ -50,6 +55,7 @@ void ccCPU(const CsrGraph &graph, int* value)
 //-----------------------------
 // CPU/GPU 结果正确性检测
 //-----------------------------
+/** @brief Compare CPU and GPU label arrays element by element. */
 bool correctTest(int n, const int* ref, const int* gpu)
 {
     bool pass = true;

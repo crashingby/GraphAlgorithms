@@ -1,3 +1,7 @@
+/**
+ * @file bfs.cu
+ * @brief CLI entry point and optional CPU oracle for single-GPU BFS.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
@@ -11,9 +15,12 @@
 #define INF 100000
 #define GPU_DEVICE 0
 
-//-----------------------------
-// CPU BFS 单源最短路径（无权图）
-//-----------------------------
+/**
+ * @brief Compute an exact CPU BFS result for optional validation.
+ * @param graph Input graph in CSR form.
+ * @param dist Output distance array.
+ * @param src Source vertex.
+ */
 void bfsCPU(const CsrGraph &graph, int* dist, int src)
 {
     const int n = graph.nodes;
@@ -39,6 +46,7 @@ void bfsCPU(const CsrGraph &graph, int* dist, int src)
 //-----------------------------
 // CPU/GPU 结果正确性检测
 //-----------------------------
+/** @brief Compare CPU and GPU distance arrays element by element. */
 bool correctTest(int n, const int* ref, const int* gpu)
 {
     bool pass = true;

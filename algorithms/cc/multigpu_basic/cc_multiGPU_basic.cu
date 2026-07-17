@@ -1,3 +1,7 @@
+/**
+ * @file cc_multiGPU_basic.cu
+ * @brief MPI entry point and optional CPU oracle for distributed CC.
+ */
 #include "cc_multiGPU_basic.cuh"
 
 #include <mpi.h>

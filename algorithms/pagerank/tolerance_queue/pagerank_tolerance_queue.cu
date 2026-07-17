@@ -1,4 +1,8 @@
 
+/**
+ * @file pagerank_tolerance_queue.cu
+ * @brief CLI entry point for queue-based single-GPU PageRank detection.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>

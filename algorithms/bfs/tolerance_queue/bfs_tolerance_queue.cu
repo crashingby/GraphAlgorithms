@@ -1,3 +1,7 @@
+/**
+ * @file bfs_tolerance_queue.cu
+ * @brief CLI entry point for queue-based single-GPU BFS detection.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>

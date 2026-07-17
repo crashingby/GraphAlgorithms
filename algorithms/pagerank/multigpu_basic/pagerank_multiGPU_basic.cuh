@@ -1,3 +1,7 @@
+/**
+ * @file pagerank_multiGPU_basic.cuh
+ * @brief MPI/NCCL rank-per-GPU PageRank baseline without fault detection.
+ */
 #ifndef PAGERANK_MULTIGPU_BASIC_CUH
 #define PAGERANK_MULTIGPU_BASIC_CUH
 
@@ -15,6 +19,13 @@
 #define PR_MN_ALPHA 0.85f
 #define PR_MN_TOL 1e-3f
 
+/**
+ * @brief Update owned PageRank values from owned and ghost predecessors.
+ * @param values Owned-plus-ghost rank cache.
+ * @param local_outdegree Outdegree for each local owned or ghost vertex.
+ * @param active Work set for owned vertices only; -1 means inactive.
+ * @param update Next work set over owned and ghost vertices.
+ */
 __global__ void pagerankDistributedPullKernel(
     float* values,
     const int* local_outdegree,
@@ -52,6 +63,12 @@ __global__ void pagerankDistributedPullKernel(
     }
 }
 
+/**
+ * @brief Execute distributed active-set PageRank without checks.
+ *
+ * Rank values and remote activations are exchanged with NCCL each iteration;
+ * MPI performs global quiescence detection and final result assembly.
+ */
 inline void pagerankMultiGPUBasic(
     float* h_value,
     const int* h_row_offsets,

@@ -1,3 +1,11 @@
+/**
+ * @file bfs_tolerance_multiGPU.cuh
+ * @brief Distributed BFS with selective DMR and asynchronous CPU checks.
+ *
+ * This implementation keeps the historical BFS-specific owned/ghost partition
+ * and peer plans. Each rank owns a compute stream, a nonblocking check stream,
+ * a reusable pinned summary pool, and one CPU consumer thread.
+ */
 #ifndef FAULT_TOLERANT_BFS_MULTIGPU_NCCL_PARTITIONED_CUH
 #define FAULT_TOLERANT_BFS_MULTIGPU_NCCL_PARTITIONED_CUH
 
@@ -28,8 +36,10 @@
 #define CHECK_BUFFER_COUNT 64
 
 // ==================== 数据结构 ====================
+/** @brief Expected per-vertex value direction used by the detector. */
 enum ValueTrend { TREND_NONE = 0, TREND_INC = 1, TREND_DEC = 2 };
 
+/** @brief Per-rank, per-iteration device summary for asynchronous checking. */
 struct MonotonicInfo {
     int dmr_error_flag;
     int monotonic_error_flag;
@@ -37,6 +47,7 @@ struct MonotonicInfo {
     int count_update;
 };
 
+/** @brief Completed host summary retained until cross-rank aggregation. */
 struct AsyncCheckResult {
     bool done = false;
     unsigned long long sum_abs_delta = 0;
@@ -45,11 +56,13 @@ struct AsyncCheckResult {
     int monotonic_error = 0;
 };
 
+/** @brief SPSC task that associates an iteration with a check buffer. */
 struct CheckTask {
     int iter = 0;
     int buf = -1;
 };
 
+/** @brief RAII guard for one NVTX profiling range. */
 struct NvtxRange {
     explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
     explicit NvtxRange(const std::string& name) : name_(name) { nvtxRangePushA(name_.c_str()); }
@@ -58,6 +71,7 @@ struct NvtxRange {
     std::string name_;
 };
 
+/** @brief Format a stable NVTX range name for an iteration and rank-local GPU. */
 inline std::string nvtx_name(const char* label, int iter, int gpu) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%s iter=%d gpu=%d", label, iter, gpu);
@@ -92,6 +106,15 @@ inline std::string nvtx_name(const char* label, int iter, int gpu) {
 // - idle 线程帮 critical 顶点重复计算；
 // - critical 主/副结果不一致则设置 dmr_error_flag。
 // 但索引空间改成“局部子图”：owned 顶点排在 [0, owned_count)，ghost 顶点排在后面。
+/**
+ * @brief Relax owned BFS vertices and duplicate selected critical pulls.
+ *
+ * Idle lanes recompute critical owned vertices from the same owned-plus-ghost
+ * arrays. There is no grid-wide snapshot: another block may update a value
+ * between the primary and redundant reads, so a mismatch is anomaly evidence
+ * rather than proof of a hardware fault. The primary result remains
+ * authoritative and no recovery is attempted.
+ */
 __global__ void bfsPullDualMultiGPUKernel(
     int* d_values,
     const int* d_row_offsets, const int* d_column_indices,
@@ -194,6 +217,7 @@ __global__ void bfsPullDualMultiGPUKernel(
     }
 }
 
+/** @brief Copy locally owned activation flags into the next work set. */
 __global__ void copyOwnedUpdateToNextActiveKernel(
     const int* d_update, int* d_next_active, int owned_count
 ) {
@@ -201,6 +225,7 @@ __global__ void copyOwnedUpdateToNextActiveKernel(
     if (i < owned_count) d_next_active[i] = d_update[i];
 }
 
+/** @brief Gather sparse integer entries into an NCCL send buffer. */
 __global__ void packByIndexKernel(
     const int* d_src, const int* d_indices, int* d_out, int n
 ) {
@@ -208,6 +233,7 @@ __global__ void packByIndexKernel(
     if (i < n) d_out[i] = d_src[d_indices[i]];
 }
 
+/** @brief Scatter an NCCL receive buffer into sparse local indices. */
 __global__ void unpackByIndexKernel(
     const int* d_in, const int* d_indices, int* d_dst, int n
 ) {
@@ -215,6 +241,7 @@ __global__ void unpackByIndexKernel(
     if (i < n) d_dst[d_indices[i]] = d_in[i];
 }
 
+/** @brief Merge received remote activation flags into owned work. */
 __global__ void applyActivationRecvKernel(
     const int* d_flags, const int* d_owned_indices, int* d_next_active, int n
 ) {
@@ -222,6 +249,10 @@ __global__ void applyActivationRecvKernel(
     if (i < n && d_flags[i] != -1) d_next_active[d_owned_indices[i]] = 1;
 }
 
+/**
+ * @brief Classify the owned work set as inactive, ordinary, or critical.
+ * @note Encodings are -1, 1, and 2 respectively.
+ */
 __global__ void scoreAndMarkKernel(
     int* d_active,
     const int* d_row_offsets,
@@ -252,12 +283,14 @@ __global__ void scoreAndMarkKernel(
 }
 
 // ==================== CPU 辅助函数 ====================
+/** @brief Count host work-set entries whose inactive sentinel is not set. */
 inline int count_active_nodes(const int* h_active, int num_nodes) {
     int cnt = 0;
     for (int i = 0; i < num_nodes; i++) if (h_active[i] != -1) cnt++;
     return cnt;
 }
 
+/** @brief Compute a nonzero maximum outdegree for score normalization. */
 inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     int max_outdegree = 0;
     for (int v = 0; v < num_nodes; v++) {
@@ -269,12 +302,14 @@ inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
 
 
 
+/** @brief Map a global vertex to its owner in the historical ceil partition. */
 inline int owner_of_vertex(int v, int nodes_per_gpu, int num_gpus) {
     int owner = v / nodes_per_gpu;
     if (owner >= num_gpus) owner = num_gpus - 1;
     return owner;
 }
 
+/** @brief Historical BFS-specific host representation of one partition. */
 struct GpuSubgraphHost {
     int start_node = 0;
     int end_node = 0;
@@ -294,6 +329,7 @@ struct GpuSubgraphHost {
     std::vector<int> ghost_owner;
 };
 
+/** @brief Resolve a global vertex to an existing or newly appended local index. */
 inline int get_or_add_local_vertex(GpuSubgraphHost& part, int global_v, bool owned) {
     auto it = part.global_to_local.find(global_v);
     if (it != part.global_to_local.end()) return it->second;
@@ -309,6 +345,7 @@ inline int get_or_add_local_vertex(GpuSubgraphHost& part, int global_v, bool own
     return local;
 }
 
+/** @brief Build one BFS owned-plus-ghost partition from complete host CSR data. */
 inline void build_vertex_partition_subgraph(
     int gpu_id, int num_gpus, int num_nodes, int nodes_per_gpu,
     const int* h_row_offsets, const int* h_column_indices,
@@ -374,6 +411,7 @@ inline void build_vertex_partition_subgraph(
     if (part.row_indices.empty()) part.row_indices.push_back(0);
 }
 
+/** @brief Sparse activation and value-exchange indices for one BFS peer. */
 struct PeerPlanHost {
     std::vector<int> act_send_local;       // sender ghost local ids, read d_update[ghost]
     std::vector<int> act_recv_owned;       // receiver owned local ids, write d_next_active[owned]
@@ -381,6 +419,7 @@ struct PeerPlanHost {
     std::vector<int> value_recv_ghost;     // receiver ghost local ids, write d_values[ghost]
 };
 
+/** @brief Device-side indices and NCCL staging buffers for one BFS peer. */
 struct PeerPlanDevice {
     int act_send_count = 0;
     int act_recv_count = 0;
@@ -398,18 +437,45 @@ struct PeerPlanDevice {
     int* d_value_recv_buf = nullptr;
 };
 
+/** @brief Upload a host index vector, preserving nullptr for an empty plan. */
 inline void upload_index_vector(const std::vector<int>& h, int** d_ptr) {
     if (h.empty()) { *d_ptr = nullptr; return; }
     CUDA_CHECK(cudaMalloc(d_ptr, h.size() * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(*d_ptr, h.data(), h.size() * sizeof(int), cudaMemcpyHostToDevice));
 }
 
+/** @brief Allocate an integer staging buffer, preserving nullptr for zero size. */
 inline void alloc_int_buffer(int** d_ptr, int n) {
     if (n <= 0) { *d_ptr = nullptr; return; }
     CUDA_CHECK(cudaMalloc(d_ptr, n * sizeof(int)));
 }
 
 // ==================== 主函数：MPI rank + Ghost 节点 + NCCL 点对点通信 ====================
+/**
+ * @brief Execute distributed BFS with asynchronous queue-based checks.
+ *
+ * The main thread produces per-iteration summaries into a bounded reusable
+ * buffer pool. A CPU worker consumes event-complete summaries concurrently.
+ * After graph convergence, MPI collectives aggregate only iterations checked
+ * by every rank, then report global DMR, monotonic, and residual anomalies.
+ * A buffer-starved iteration still executes with scratch storage but contributes
+ * no detection evidence to the final report.
+ *
+ * @param h_value Output distances for all global vertices.
+ * @param h_row_offsets Global outgoing CSR offsets.
+ * @param h_column_indices Global outgoing CSR destinations.
+ * @param h_column_offsets Global incoming CSR offsets.
+ * @param h_row_indices Global incoming CSR sources.
+ * @param num_nodes Global vertex count.
+ * @param num_edges Global edge count, retained for the common entry signature.
+ * @param src BFS source vertex.
+ * @param alpha Outdegree weight in criticality scoring.
+ * @param beta Active-value weight in criticality scoring.
+ * @param threshold Critical-vertex score threshold.
+ *
+ * @pre MPI has been initialized with at least MPI_THREAD_FUNNELED.
+ * @pre Every rank supplies the same graph and can access a CUDA device.
+ */
 inline void bfsMultiGPU(
     int* h_value,
     const int* h_row_offsets, const int* h_column_indices,
@@ -729,7 +795,7 @@ inline void bfsMultiGPU(
     cudaEvent_t start_evt, stop_evt;
     CUDA_CHECK(cudaEventCreate(&start_evt));
     CUDA_CHECK(cudaEventCreate(&stop_evt));
-    CUDA_CHECK(cudaEventRecord(start_evt));
+    CUDA_CHECK(cudaEventRecord(start_evt, stream));
 
     int iter = 0;
     while (iter < 1000) {
@@ -773,10 +839,11 @@ inline void bfsMultiGPU(
                     check_stream
                 ));
                 CUDA_CHECK(cudaEventRecord(check_events[check_buf], check_stream));
-                if (!pending_tasks.try_push({iter, check_buf})) {
-                    fprintf(stderr, "rank %d: 检测任务队列已满，跳过 iter=%d 的 CPU 检测。\n", world_rank, iter);
-                    CUDA_CHECK(cudaEventSynchronize(check_events[check_buf]));
-                    free_buffers.try_push(check_buf);
+                // Keep queue ownership strictly SPSC: only the worker returns
+                // slots to free_buffers. With equal pool and queue capacities,
+                // this loop normally succeeds on its first attempt.
+                while (!pending_tasks.try_push({iter, check_buf})) {
+                    std::this_thread::yield();
                 }
             }
         }
@@ -820,6 +887,15 @@ inline void bfsMultiGPU(
         std::swap(d_active, d_next_active);
     }
 
+    // Stop before draining CPU checks so all four checked algorithms report
+    // the same GPU-main-pipeline interval. Rank zero prints the slowest rank.
+    CUDA_CHECK(cudaEventRecord(stop_evt, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop_evt));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start_evt, stop_evt));
+    float max_ms = 0.0f;
+    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+
     while (!pending_tasks.empty()) std::this_thread::yield();
     check_stop.store(true, std::memory_order_release);
     if (check_worker.joinable()) check_worker.join();
@@ -830,6 +906,7 @@ inline void bfsMultiGPU(
     int first_dmr_iter = -1;
     int first_monotonic_iter = -1;
     int first_avg_increase_iter = -1;
+    int checked_iteration_count = 0;
     float previous_avg_delta = (float)INF;
 
     for (int check_iter = 1; check_iter <= iter; ++check_iter) {
@@ -837,6 +914,7 @@ inline void bfsMultiGPU(
         int all_done = 0;
         MPI_Allreduce(&local_done, &all_done, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
         if (!all_done) continue;
+        ++checked_iteration_count;
 
         unsigned long long local_sum = check_results[check_iter].sum_abs_delta;
         unsigned long long global_sum = 0;
@@ -886,13 +964,6 @@ inline void bfsMultiGPU(
         MPI_COMM_WORLD
     );
 
-    CUDA_CHECK(cudaEventRecord(stop_evt));
-    CUDA_CHECK(cudaEventSynchronize(stop_evt));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start_evt, stop_evt));
-    float max_ms = 0.0f;
-    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
-
     if (world_rank == 0) {
         printf("GPU time: %.4f ms\n", max_ms);
         printf("NCCL 分布式 BFS 迭代 %d 次正常结束。\n", iter);
@@ -903,6 +974,8 @@ inline void bfsMultiGPU(
         printf(", avg_delta_increase=%d", detected_avg_increase ? 1 : 0);
         if (first_avg_increase_iter >= 0) printf("(first_iter=%d)", first_avg_increase_iter);
         printf("\n");
+        printf("异步检测覆盖: checked=%d/%d, skipped=%d\n",
+               checked_iteration_count, iter, iter - checked_iteration_count);
     }
 
     cudaFree(d_values);

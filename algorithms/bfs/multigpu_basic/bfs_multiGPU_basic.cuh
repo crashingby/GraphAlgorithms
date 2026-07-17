@@ -1,3 +1,7 @@
+/**
+ * @file bfs_multiGPU_basic.cuh
+ * @brief MPI/NCCL rank-per-GPU BFS baseline without fault detection.
+ */
 #ifndef BFS_MULTIGPU_BASIC_CUH
 #define BFS_MULTIGPU_BASIC_CUH
 
@@ -14,6 +18,12 @@
 
 #define BFS_MN_INF 100000
 
+/**
+ * @brief Relax owned active vertices using owned and ghost distance values.
+ * @param values Local value array ordered as owned vertices followed by ghosts.
+ * @param active Work set for owned vertices only; -1 means inactive.
+ * @param update Next work set over the complete owned-plus-ghost index space.
+ */
 __global__ void bfsDistributedPullKernel(
     int* values,
     const int* row_offsets,
@@ -49,6 +59,13 @@ __global__ void bfsDistributedPullKernel(
     }
 }
 
+/**
+ * @brief Execute distributed BFS without resilience checks.
+ *
+ * Each MPI rank owns a contiguous vertex range, caches remote dependencies as
+ * ghosts, exchanges activations and distance values through NCCL, and uses an
+ * MPI all-reduce to detect global quiescence.
+ */
 inline void bfsMultiGPUBasic(
     int* h_value,
     const int* h_row_offsets,

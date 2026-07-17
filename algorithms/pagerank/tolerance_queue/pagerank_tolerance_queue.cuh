@@ -1,3 +1,7 @@
+/**
+ * @file pagerank_tolerance_queue.cuh
+ * @brief Single-GPU PageRank with selective DMR and asynchronous CPU checks.
+ */
 #include <cuda_runtime.h>
 #include <nvToolsExt.h>
 #include <stdio.h>
@@ -24,12 +28,14 @@
 } while (0)
 #endif
 
+/** @brief Value-trend selector retained for the common detector vocabulary. */
 enum ValueTrend {
     TREND_NONE = 0,
     TREND_INC = 1,
     TREND_DEC = 2
 };
 
+/** @brief Queue item binding an iteration to a reusable check buffer. */
 struct CheckTask {
     int iter = 0;
     int buf = -1;
@@ -48,6 +54,7 @@ inline std::string nvtx_name(const char* label, int iter) {
     return std::string(buf);
 }
 
+/** @brief Return the maximum outgoing degree used to normalize criticality. */
 inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     int max_outdegree = 1;
     for (int v = 0; v < num_nodes; ++v) {
@@ -58,6 +65,7 @@ inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
 }
 
 
+/** @brief Count active vertices and classify ordinary versus critical work. */
 __global__ void scoreAndMarkFloatKernel(
     int* d_active,
     const float* d_values,
@@ -83,6 +91,7 @@ __global__ void scoreAndMarkFloatKernel(
 #define PR_ALPHA 0.85f
 #define PR_TOL 1e-3f
 
+/** @brief Per-iteration DMR and residual summary produced on the device. */
 struct MonotonicInfo {
     int dmr_error_flag;
     int monotonic_error_flag;
@@ -90,6 +99,7 @@ struct MonotonicInfo {
     int count_update;
 };
 
+/** @brief Host-side interpretation of one completed residual summary. */
 struct AsyncCheckResult {
     bool done = false;
     double sum_abs_delta = 0.0;
@@ -98,6 +108,10 @@ struct AsyncCheckResult {
     int monotonic_error = 0;
 };
 
+/**
+ * @brief Update ranks and selectively duplicate critical pull calculations.
+ * @note DMR mismatches are reported only; the primary result is retained.
+ */
 __global__ void pagerankPullDualKernel(
     float* d_values,
     const int* d_row_offsets,
@@ -172,6 +186,12 @@ __global__ void pagerankPullDualKernel(
     }
 }
 
+/**
+ * @brief Execute PageRank with asynchronous queue-based DMR/residual checks.
+ *
+ * A background CPU consumer reads completed pinned summaries and compares the
+ * mean residual across iterations while the main thread continues GPU work.
+ */
 void pagerankGPU(
     float* h_value,
     const int* h_row_offsets,

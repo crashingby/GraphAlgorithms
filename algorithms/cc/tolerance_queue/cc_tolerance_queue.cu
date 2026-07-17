@@ -1,4 +1,8 @@
 
+/**
+ * @file cc_tolerance_queue.cu
+ * @brief CLI entry point for queue-based single-GPU CC detection.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>

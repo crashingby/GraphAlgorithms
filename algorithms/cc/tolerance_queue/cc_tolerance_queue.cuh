@@ -1,3 +1,7 @@
+/**
+ * @file cc_tolerance_queue.cuh
+ * @brief Single-GPU CC with selective DMR and asynchronous CPU checks.
+ */
 #include <cuda_runtime.h>
 #include <nvToolsExt.h>
 #include <stdio.h>
@@ -24,12 +28,14 @@
 } while (0)
 #endif
 
+/** @brief Expected direction of a vertex value across iterations. */
 enum ValueTrend {
     TREND_NONE = 0,
     TREND_INC = 1,
     TREND_DEC = 2
 };
 
+/** @brief Queue item binding an iteration to a reusable check buffer. */
 struct CheckTask {
     int iter = 0;
     int buf = -1;
@@ -48,6 +54,7 @@ inline std::string nvtx_name(const char* label, int iter) {
     return std::string(buf);
 }
 
+/** @brief Return the maximum outgoing degree used to normalize criticality. */
 inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     int max_outdegree = 1;
     for (int v = 0; v < num_nodes; ++v) {
@@ -57,6 +64,7 @@ inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     return max_outdegree;
 }
 
+/** @brief Count active labels and classify ordinary versus critical vertices. */
 __global__ void scoreAndMarkIntKernel(
     int* d_active,
     const int* d_values,
@@ -79,6 +87,7 @@ __global__ void scoreAndMarkIntKernel(
     }
 }
 
+/** @brief Per-iteration device summary copied to a reusable host buffer. */
 struct MonotonicInfo {
     int dmr_error_flag;
     int monotonic_error_flag;
@@ -86,6 +95,7 @@ struct MonotonicInfo {
     int count_update;
 };
 
+/** @brief Host-side interpretation of one completed check summary. */
 struct AsyncCheckResult {
     bool done = false;
     unsigned long long sum_abs_delta = 0;
@@ -94,6 +104,10 @@ struct AsyncCheckResult {
     int monotonic_error = 0;
 };
 
+/**
+ * @brief Propagate labels and selectively duplicate critical work in idle lanes.
+ * @note Detected DMR or monotonic faults are reported only; values are not repaired.
+ */
 __global__ void ccPullDualKernel(
     int* d_values,
     const int* d_row_offsets,
@@ -175,6 +189,13 @@ __global__ void ccPullDualKernel(
     }
 }
 
+/**
+ * @brief Execute CC with a producer/consumer asynchronous check pipeline.
+ *
+ * The main thread queues GPU summaries into reusable buffers. A background
+ * CPU consumer waits on CUDA events, evaluates DMR/monotonic/residual signals,
+ * and recycles buffers without blocking the next graph iteration.
+ */
 void ccGPU(
     int* h_value,
     const int* h_row_offsets,

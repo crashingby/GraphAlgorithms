@@ -1,3 +1,7 @@
+/**
+ * @file kcore.cu
+ * @brief CLI entry point and optional CPU oracle for single-GPU k-core.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
@@ -12,6 +16,7 @@
 //-----------------------------
 // CPU KCORE 连通分量
 //-----------------------------
+/** @brief Run the CPU iterative-peeling reference implementation. */
 void kcoreCPU(const CsrGraph &graph, int* value, int k)
 {
     const int n = graph.nodes;
@@ -51,6 +56,12 @@ void kcoreCPU(const CsrGraph &graph, int* value, int k)
 //-----------------------------
 // CPU/GPU 结果正确性检测
 //-----------------------------
+/**
+ * @brief Compare CPU and GPU k-core outcomes.
+ *
+ * Values below @p k are treated as equivalent because both denote a peeled
+ * vertex even if the final residual degree differs.
+ */
 bool correctTest(int n, const int* ref, const int* gpu, int k)
 {
     bool pass = true;

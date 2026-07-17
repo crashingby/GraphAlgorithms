@@ -1,3 +1,7 @@
+/**
+ * @file pagerank_multiGPU_basic.cu
+ * @brief MPI entry point for distributed PageRank without checks.
+ */
 #include "pagerank_multiGPU_basic.cuh"
 
 #include <mpi.h>

@@ -1,3 +1,10 @@
+/**
+ * @file pagerank_gpu.cuh
+ * @brief Single-GPU active-set PageRank baseline.
+ *
+ * Active vertices pull contributions from incoming neighbors and activate
+ * outgoing neighbors when the local residual reaches the fixed tolerance.
+ */
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <math.h> 
@@ -8,7 +15,12 @@
 #define ALPHA  0.85   //PageRank 的阻尼因子（一般为 0.85）
 #define tol  1e-3f
 
-// ==================== GPU pagerank 拉模式核函数 ====================
+/**
+ * @brief Perform one in-place PageRank pull iteration on active vertices.
+ * @param d_values In-place rank values.
+ * @param d_active Current work-set bitmap; zero means inactive.
+ * @param d_update Next-iteration work-set bitmap.
+ */
 __global__ void pagerankPullKernel(
     float* d_values,
     const int* d_row_offsets,
@@ -48,7 +60,7 @@ __global__ void pagerankPullKernel(
   }
 
 
-// ==================== GPU 统计活跃顶点 ====================
+/** @brief Count nonzero work-set entries. */
 __global__ void countActiveKernel(
     const int* d_active,
     int* d_num_active,
@@ -60,7 +72,16 @@ __global__ void countActiveKernel(
     }
 }
 
-// ==================== GPU pagerank 主函数 ====================
+/**
+ * @brief Execute the single-GPU active-set PageRank baseline.
+ * @param h_value Host output rank array.
+ * @param h_row_offsets Host outgoing CSR row offsets.
+ * @param h_column_indices Host outgoing CSR destinations.
+ * @param h_column_offsets Host incoming CSR column offsets.
+ * @param h_row_indices Host incoming CSR sources.
+ * @param num_nodes Number of vertices.
+ * @param num_edges Number of directed edges.
+ */
 void pagerankGPU(
     float* h_value,
     const int* h_row_offsets,

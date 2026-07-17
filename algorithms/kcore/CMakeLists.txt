@@ -1,10 +1,7 @@
 add_graph_cuda_executable(kcore kcore basic/kcore.cu)
-add_graph_cuda_executable(kcore_threshold kcore tolerance_threshold/kcore_tolerance_threshold.cu)
 add_graph_cuda_executable(kcore_queue kcore tolerance_queue/kcore_tolerance_queue.cu)
-add_graph_cuda_executable(kcore_compact_queue kcore tolerance_compact_queue/kcore_tolerance_compact_queue.cu)
 add_graph_mpi_nccl_executable(kcore_multiGPU kcore multigpu/kcore_tolerance_multiGPU.cu)
 add_graph_mpi_nccl_executable(kcore_multiGPU_basic kcore multigpu_basic/kcore_multiGPU_basic.cu)
 
 target_link_libraries(kcore_queue PRIVATE CUDA::nvToolsExt)
-target_link_libraries(kcore_compact_queue PRIVATE CUDA::nvToolsExt)
 target_link_libraries(kcore_multiGPU PRIVATE CUDA::nvToolsExt)

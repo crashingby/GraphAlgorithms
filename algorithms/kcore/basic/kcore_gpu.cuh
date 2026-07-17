@@ -1,3 +1,10 @@
+/**
+ * @file kcore_gpu.cuh
+ * @brief Single-GPU iterative k-core peeling baseline.
+ *
+ * Active vertices recount live incoming neighbors. Vertices below @c k are
+ * marked dead once and activate their outgoing neighbors.
+ */
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,7 +12,14 @@
 #define INF 100000
 #define BLOCK_SIZE 256
 
-// ==================== GPU KCORE 拉模式核函数 ====================
+/**
+ * @brief Recount live neighbors and peel vertices below the threshold.
+ * @param d_values In-place remaining-degree estimates.
+ * @param d_alive Persistent live/dead vertex flags.
+ * @param d_active Current work-set bitmap; zero means inactive.
+ * @param d_update Next-iteration work-set bitmap.
+ * @param k Peeling threshold.
+ */
 __global__ void kcorePullKernel(
     int* d_values,
     int* d_alive,
@@ -43,7 +57,7 @@ __global__ void kcorePullKernel(
   }
 
 
-// ==================== GPU 统计活跃顶点 ====================
+/** @brief Count nonzero work-set entries. */
 __global__ void countActiveKernel(
     const int* d_active,
     int* d_num_active,
@@ -55,7 +69,17 @@ __global__ void countActiveKernel(
     }
 }
 
-// ==================== GPU KCORE 主函数 ====================
+/**
+ * @brief Execute single-GPU iterative k-core peeling.
+ * @param h_value Host output remaining-degree array.
+ * @param h_row_offsets Host outgoing CSR row offsets.
+ * @param h_column_indices Host outgoing CSR destinations.
+ * @param h_column_offsets Host incoming CSR column offsets.
+ * @param h_row_indices Host incoming CSR sources.
+ * @param num_nodes Number of vertices.
+ * @param num_edges Number of directed edges.
+ * @param k Peeling threshold.
+ */
 void kcoreGPU(
     int* h_value,
     const int* h_row_offsets,

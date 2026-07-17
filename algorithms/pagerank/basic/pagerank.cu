@@ -1,3 +1,7 @@
+/**
+ * @file pagerank.cu
+ * @brief CLI entry point for the single-GPU PageRank baseline.
+ */
 #include <stdio.h>
 #include <cstdlib>
 #include <iostream>
@@ -13,6 +17,10 @@
 //-----------------------------
 // CPU PageRank
 //-----------------------------
+/**
+ * @brief Placeholder for a CPU PageRank oracle.
+ * @note The current project intentionally leaves this reference empty.
+ */
 void pagerankCPU(const CsrGraph &graph, float* value)
 {
   
@@ -21,6 +29,7 @@ void pagerankCPU(const CsrGraph &graph, float* value)
 //-----------------------------
 // CPU/GPU 结果正确性检测
 //-----------------------------
+/** @brief Compare CPU and GPU rank arrays element by element. */
 bool correctTest(int n, const float* ref, const float* gpu)
 {
     bool pass = true;

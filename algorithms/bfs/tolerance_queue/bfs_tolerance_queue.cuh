@@ -1,3 +1,7 @@
+/**
+ * @file bfs_tolerance_queue.cuh
+ * @brief Single-GPU BFS with selective DMR and asynchronous CPU checks.
+ */
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,12 +23,14 @@
 #define CHECK_BUFFER_COUNT 64
 
 // ==================== 结构体 ====================
+/** @brief Expected direction of a vertex value across iterations. */
 enum ValueTrend {
     TREND_NONE = 0,  // 不检测
     TREND_INC  = 1,  // 单调递增
     TREND_DEC  = 2   // 单调递减
 };
 
+/** @brief Per-iteration device summary copied asynchronously to pinned host memory. */
 struct MonotonicInfo {
     int dmr_error_flag;       // 冗余计算不一致标志（设备端写入）
     int monotonic_error_flag; // 单调性违反标志（设备端写入）
@@ -32,6 +38,7 @@ struct MonotonicInfo {
     int count_update;
 };
 
+/** @brief Host-side interpretation of one completed GPU check summary. */
 struct AsyncCheckResult {
     bool done = false;
     unsigned long long sum_abs_delta = 0;
@@ -40,6 +47,7 @@ struct AsyncCheckResult {
     int monotonic_error = 0;
 };
 
+/** @brief Queue item binding an iteration to a reusable check buffer. */
 struct CheckTask {
     int iter = 0;
     int buf = -1;
@@ -61,6 +69,12 @@ inline std::string nvtx_name(const char* label, int iter) {
 
 // ==================== Kernel: 计算得分并根据阈值标记关键顶点 ====================
 // 替换了原来的 collectAndScoreKernel 和 markCriticalKernel
+/**
+ * @brief Count active vertices and classify them as ordinary or critical.
+ *
+ * Active states are encoded as -1 (inactive), 1 (ordinary), and 2 (critical).
+ * Critical vertices are eligible for redundant execution in the next kernel.
+ */
 __global__ void scoreAndMarkKernel(
     int* d_active, 
     const int* d_row_offsets, 
@@ -94,6 +108,13 @@ __global__ void scoreAndMarkKernel(
 }
 
 // ==================== Kernel：BFS 拉模式 + 双模冗余 ====================
+/**
+ * @brief Relax BFS values and selectively duplicate critical work within a block.
+ *
+ * Active threads perform the primary pull. Idle lanes recompute as many
+ * critical vertices as available capacity permits and report mismatches in
+ * @p d_info. The kernel only detects faults; it does not repair values.
+ */
 __global__ void bfsPullDualKernel(
     int* d_values,
     const int* d_row_offsets,
@@ -208,6 +229,7 @@ __global__ void bfsPullDualKernel(
 }
 
 // ==================== 计算整个图的最大出度 ====================
+/** @brief Return the maximum outgoing degree used to normalize criticality. */
 int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     int max_outdegree = 0;
     for (int v = 0; v < num_nodes; v++) {
@@ -218,6 +240,15 @@ int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
 }
 
 // ==================== 主函数：全GPU容错版 (阈值判定版) ====================
+/**
+ * @brief Execute BFS with asynchronous queue-based fault detection.
+ *
+ * The producer (main thread) launches compute and D2H summary copies into a
+ * reusable buffer pool. A single CPU consumer polls completion events, scans
+ * summaries, records DMR/monotonic/residual anomalies, and returns buffers.
+ * If no buffer is free, computation continues through a scratch summary and
+ * that iteration intentionally has no CPU-side check.
+ */
 void bfsGPU(
     int* h_value,
     const int* h_row_offsets,

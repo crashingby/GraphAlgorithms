@@ -1,3 +1,7 @@
+/**
+ * @file bfs_multiGPU_basic.cu
+ * @brief MPI entry point and optional CPU oracle for distributed BFS.
+ */
 #include "bfs_multiGPU_basic.cuh"
 
 #include <mpi.h>

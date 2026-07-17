@@ -1,3 +1,7 @@
+/**
+ * @file kcore_tolerance_multiGPU.cuh
+ * @brief Distributed k-core with selective DMR and asynchronous CPU checks.
+ */
 #ifndef KCORE_TOLERANCE_MULTIGPU_CUH
 #define KCORE_TOLERANCE_MULTIGPU_CUH
 
@@ -8,17 +12,70 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #include "include/distributed_partition.cuh"
+#include "include/spsc_queue.h"
 
+/** Number of reusable device/host slots in the asynchronous checker. */
+constexpr int KCORE_CHECK_BUFFER_COUNT = 64;
+
+/** Maximum number of KCore iterations and therefore result slots. */
+constexpr int KCORE_MAX_ITERATIONS = 1000;
+
+/**
+ * @brief Per-iteration error evidence accumulated by the GPU.
+ *
+ * A buffer is written by exactly one KCore iteration. The compute stream
+ * records an event after the kernel, and the check stream then copies this
+ * fixed-size structure to pinned host memory without blocking the main loop.
+ */
 struct KcoreDistributedCheckInfo {
+    /** Set when the primary and redundant computations disagree. */
     int dmr_error_flag;
+    /** Set when a degree increases, which violates KCore monotonicity. */
     int monotonic_error_flag;
+    /** Sum of absolute degree changes produced by this rank. */
     unsigned long long sum_abs_delta;
+    /** Number of owned vertices whose degree changed. */
     int count_update;
 };
 
+/** @brief Host-side snapshot produced by the asynchronous check worker. */
+struct KcoreAsyncCheckResult {
+    bool done = false;
+    unsigned long long sum_abs_delta = 0;
+    int count_update = 0;
+    int dmr_error = 0;
+    int monotonic_error = 0;
+};
+
+/** @brief Queue item associating an iteration with a reusable check buffer. */
+struct KcoreCheckTask {
+    int iter = 0;
+    int buffer = -1;
+};
+
+/**
+ * @brief Classify active owned vertices as ordinary or critical.
+ *
+ * The score combines normalized out-degree and the current KCore degree.
+ * A value of `2` marks a critical vertex whose update should be recomputed by
+ * an idle thread in kcoreDistributedToleranceKernel(); `1` is ordinary and
+ * `-1` remains inactive.
+ *
+ * @param active Active-state array for owned vertices.
+ * @param values Current local degree values; owned entries come first.
+ * @param row_offsets Outgoing CSR offsets for owned vertices.
+ * @param owned_count Number of vertices owned by this rank.
+ * @param max_outdegree Global maximum out-degree used for normalization.
+ * @param alpha Weight of normalized out-degree.
+ * @param beta Weight of the current-value score.
+ * @param threshold Critical-vertex score threshold.
+ * @param count Number of active owned vertices encountered.
+ */
 __global__ void kcoreDistributedScoreAndMarkKernel(
     int* active,
     const int* values,
@@ -41,6 +98,34 @@ __global__ void kcoreDistributedScoreAndMarkKernel(
     active[v] = (score >= threshold) ? 2 : 1;
 }
 
+/**
+ * @brief Recompute local degrees, peel vertices, and collect fault evidence.
+ *
+ * Active owned vertices perform the normal KCore update. Within each block,
+ * idle lanes recompute as many critical updates as possible; disagreement is
+ * reported through @p check_info. The kernel also checks that local degrees
+ * never increase and accumulates degree-change statistics. Peeling and
+ * propagation semantics are unchanged: a vertex whose new degree is below
+ * @p k is marked dead, and its outgoing neighbours are activated through
+ * @p update, including ghost entries that will be sent to their owners.
+ *
+ * @warning Block barriers do not freeze the grid-wide alive array. Other
+ * blocks may peel vertices between primary and redundant recounts, so DMR is
+ * an anomaly signal rather than definitive hardware-fault evidence.
+ *
+ * @param values Degree values for owned vertices followed by ghost cache.
+ * @param alive Alive flags for owned vertices followed by ghost cache.
+ * @param row_offsets Outgoing CSR offsets for owned vertices.
+ * @param column_indices Outgoing destination local IDs.
+ * @param column_offsets Incoming CSC offsets for owned vertices.
+ * @param row_indices Incoming source local IDs.
+ * @param active Current active states for owned vertices.
+ * @param update Next-iteration activation flags in local ID space.
+ * @param owned_count Number of vertices owned by this rank.
+ * @param local_node_count Number of owned plus ghost vertices on this rank.
+ * @param k Requested KCore threshold.
+ * @param check_info Per-iteration GPU check accumulator.
+ */
 __global__ void kcoreDistributedToleranceKernel(
     int* values,
     int* alive,
@@ -131,6 +216,34 @@ __global__ void kcoreDistributedToleranceKernel(
     }
 }
 
+/**
+ * @brief Run fault-detecting distributed KCore with asynchronous CPU checks.
+ *
+ * Each MPI rank owns a contiguous vertex partition and stores remote
+ * neighbours as ghosts. NCCL exchanges activation flags and alive-state
+ * caches after every peeling step. Fault evidence is transferred through a
+ * fixed pool of pinned buffers on a non-blocking check stream; a background
+ * CPU worker polls completion events and stores results by iteration. Once
+ * computation finishes, MPI reductions combine DMR, monotonicity, and average
+ * delta-increase evidence across ranks. Detection is observational only: it
+ * does not roll back or repair KCore state. If no check buffer is free, the
+ * iteration uses scratch storage and contributes no final detection evidence.
+ *
+ * @param[out] h_value Global degree/result array, assembled on every rank.
+ * @param h_row_offsets Global outgoing CSR offsets.
+ * @param h_column_indices Global outgoing CSR destinations.
+ * @param h_column_offsets Global incoming CSC offsets.
+ * @param h_row_indices Global incoming CSC sources.
+ * @param num_nodes Number of graph vertices.
+ * @param num_edges Number of graph edges (unused after graph construction).
+ * @param k Requested KCore threshold.
+ * @param alpha Criticality weight for normalized out-degree.
+ * @param beta Criticality weight for current degree.
+ * @param threshold Score at or above which an active vertex is critical.
+ *
+ * @pre MPI has been initialized with at least MPI_THREAD_FUNNELED.
+ * @pre Every rank can access a CUDA device and num_nodes is at least the rank count.
+ */
 inline void kcoreMultiGPU(
     int* h_value,
     const int* h_row_offsets,
@@ -138,12 +251,13 @@ inline void kcoreMultiGPU(
     const int* h_column_offsets,
     const int* h_row_indices,
     int num_nodes,
-    int /*num_edges*/,
+    int num_edges,
     int k,
     float alpha = 0.5f,
     float beta = 0.5f,
     float threshold = 0.3f
 ) {
+    (void)num_edges;
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
     if (!mpi_initialized) {
@@ -183,7 +297,11 @@ inline void kcoreMultiGPU(
     int *d_values = nullptr, *d_alive = nullptr, *d_row_offsets = nullptr;
     int *d_column_indices = nullptr, *d_column_offsets = nullptr, *d_row_indices = nullptr;
     int *d_active = nullptr, *d_update = nullptr, *d_active_count = nullptr;
-    KcoreDistributedCheckInfo* d_check_info = nullptr;
+    KcoreDistributedCheckInfo* d_check_info_scratch = nullptr;
+    std::vector<KcoreDistributedCheckInfo*> d_check_info(KCORE_CHECK_BUFFER_COUNT, nullptr);
+    std::vector<KcoreDistributedCheckInfo*> h_check_info(KCORE_CHECK_BUFFER_COUNT, nullptr);
+    std::vector<cudaEvent_t> compute_done_events(KCORE_CHECK_BUFFER_COUNT);
+    std::vector<cudaEvent_t> check_done_events(KCORE_CHECK_BUFFER_COUNT);
 
     CUDA_CHECK(cudaMalloc(&d_values, part.local_node_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_alive, part.local_node_count * sizeof(int)));
@@ -194,7 +312,15 @@ inline void kcoreMultiGPU(
     CUDA_CHECK(cudaMalloc(&d_active, part.owned_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_update, part.local_node_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_active_count, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_check_info, sizeof(KcoreDistributedCheckInfo)));
+    CUDA_CHECK(cudaMalloc(&d_check_info_scratch, sizeof(KcoreDistributedCheckInfo)));
+    for (int buffer = 0; buffer < KCORE_CHECK_BUFFER_COUNT; ++buffer) {
+        CUDA_CHECK(cudaMalloc(&d_check_info[buffer], sizeof(KcoreDistributedCheckInfo)));
+        CUDA_CHECK(cudaMallocHost(&h_check_info[buffer], sizeof(KcoreDistributedCheckInfo)));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &compute_done_events[buffer], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &check_done_events[buffer], cudaEventDisableTiming));
+    }
 
     std::vector<int> h_local_value(part.local_node_count, 0);
     for (int lv = 0; lv < part.owned_count; ++lv) {
@@ -212,10 +338,52 @@ inline void kcoreMultiGPU(
     CUDA_CHECK(cudaMemcpy(d_active, h_active.data(), part.owned_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_update, 0xff, part.local_node_count * sizeof(int)));
 
-    cudaStream_t stream;
+    cudaStream_t stream, check_stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&check_stream, cudaStreamNonBlocking));
     dg_nccl_exchange_int_values(d_alive, plans, world_size, rank, comm, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // The main thread consumes free slots and produces pending tasks. The
+    // worker does the inverse, so both queues remain single-producer/single-consumer.
+    SpscQueue<int, KCORE_CHECK_BUFFER_COUNT> free_buffers;
+    SpscQueue<KcoreCheckTask, KCORE_CHECK_BUFFER_COUNT> pending_tasks;
+    for (int buffer = 0; buffer < KCORE_CHECK_BUFFER_COUNT; ++buffer) {
+        free_buffers.try_push(buffer);
+    }
+    std::atomic<bool> check_stop(false);
+    std::vector<KcoreAsyncCheckResult> check_results(KCORE_MAX_ITERATIONS + 1);
+
+    std::thread check_worker([&]() {
+        CUDA_CHECK(cudaSetDevice(device));
+        while (!check_stop.load(std::memory_order_relaxed) || !pending_tasks.empty()) {
+            bool progressed = false;
+            KcoreCheckTask task;
+            if (pending_tasks.peek(task)) {
+                cudaError_t status = cudaEventQuery(check_done_events[task.buffer]);
+                if (status == cudaSuccess) {
+                    pending_tasks.try_pop(task);
+                    const KcoreDistributedCheckInfo& info = *h_check_info[task.buffer];
+
+                    KcoreAsyncCheckResult result;
+                    result.done = true;
+                    result.sum_abs_delta = info.sum_abs_delta;
+                    result.count_update = info.count_update;
+                    result.dmr_error = info.dmr_error_flag;
+                    result.monotonic_error = info.monotonic_error_flag;
+                    if (task.iter >= 0 && task.iter < (int)check_results.size()) {
+                        check_results[task.iter] = result;
+                    }
+
+                    free_buffers.try_push(task.buffer);
+                    progressed = true;
+                } else if (status != cudaErrorNotReady) {
+                    CUDA_CHECK(status);
+                }
+            }
+            if (!progressed) std::this_thread::yield();
+        }
+    });
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
@@ -224,20 +392,46 @@ inline void kcoreMultiGPU(
 
     int iter = 0;
     int total_active = num_nodes;
-    double pre_avg_delta = 0.0;
-    int local_dmr = 0, local_monotonic = 0, local_avg_increase = 0;
 
-    while (iter < 1000 && total_active > 0) {
+    while (iter < KCORE_MAX_ITERATIONS && total_active > 0) {
         ++iter;
         CUDA_CHECK(cudaMemsetAsync(d_active_count, 0, sizeof(int), stream));
         kcoreDistributedScoreAndMarkKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
             d_active, d_values, d_row_offsets, part.owned_count, max_outdegree,
             alpha, beta, threshold, d_active_count);
 
-        CUDA_CHECK(cudaMemsetAsync(d_check_info, 0, sizeof(KcoreDistributedCheckInfo), stream));
+        int check_buffer = -1;
+        bool enqueue_check = free_buffers.try_pop(check_buffer);
+        KcoreDistributedCheckInfo* iteration_info = enqueue_check
+            ? d_check_info[check_buffer]
+            : d_check_info_scratch;
+
+        CUDA_CHECK(cudaMemsetAsync(
+            iteration_info, 0, sizeof(KcoreDistributedCheckInfo), stream));
         kcoreDistributedToleranceKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
             d_values, d_alive, d_row_offsets, d_column_indices, d_column_offsets, d_row_indices,
-            d_active, d_update, part.owned_count, part.local_node_count, k, d_check_info);
+            d_active, d_update, part.owned_count, part.local_node_count, k, iteration_info);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (enqueue_check) {
+            // The check stream starts the tiny D2H copy as soon as this
+            // iteration kernel finishes; NCCL and next-active construction
+            // continue independently on the compute stream.
+            CUDA_CHECK(cudaEventRecord(compute_done_events[check_buffer], stream));
+            CUDA_CHECK(cudaStreamWaitEvent(
+                check_stream, compute_done_events[check_buffer], 0));
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_check_info[check_buffer],
+                d_check_info[check_buffer],
+                sizeof(KcoreDistributedCheckInfo),
+                cudaMemcpyDeviceToHost,
+                check_stream));
+            CUDA_CHECK(cudaEventRecord(check_done_events[check_buffer], check_stream));
+
+            while (!pending_tasks.try_push({iter, check_buffer})) {
+                std::this_thread::yield();
+            }
+        }
 
         CUDA_CHECK(cudaMemsetAsync(d_active, 0xff, part.owned_count * sizeof(int), stream));
         dgCopyOwnedUpdateKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(d_update, d_active, part.owned_count);
@@ -249,37 +443,76 @@ inline void kcoreMultiGPU(
         dgCountActiveKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(d_active, d_active_count, part.owned_count);
 
         int local_active = 0;
-        KcoreDistributedCheckInfo h_info{0, 0, 0, 0};
         CUDA_CHECK(cudaMemcpyAsync(&local_active, d_active_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(&h_info, d_check_info, sizeof(KcoreDistributedCheckInfo), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        unsigned long long local_sum_delta = h_info.sum_abs_delta;
-        int local_count_delta = h_info.count_update;
-        unsigned long long global_sum_delta = 0;
-        int global_count_delta = 0;
         MPI_Allreduce(&local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&local_sum_delta, &global_sum_delta, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&local_count_delta, &global_count_delta, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-
-        if (global_count_delta > 0) {
-            double avg_delta = (double)global_sum_delta / (double)global_count_delta;
-            if (avg_delta > pre_avg_delta && iter > 1) local_avg_increase = 1;
-            pre_avg_delta = avg_delta;
-        }
-        if (h_info.dmr_error_flag) local_dmr = 1;
-        if (h_info.monotonic_error_flag) local_monotonic = 1;
     }
 
     CUDA_CHECK(cudaEventRecord(stop, stream));
     CUDA_CHECK(cudaEventSynchronize(stop));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    float max_ms = 0.0f;
+    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    int global_dmr = 0, global_monotonic = 0, global_avg_increase = 0;
-    MPI_Allreduce(&local_dmr, &global_dmr, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-    MPI_Allreduce(&local_monotonic, &global_monotonic, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-    MPI_Allreduce(&local_avg_increase, &global_avg_increase, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+    // Drain all copies before MPI aggregation. No MPI call is made by the
+    // worker because common MPI installations only guarantee funneled access.
+    while (!pending_tasks.empty()) std::this_thread::yield();
+    check_stop.store(true, std::memory_order_release);
+    if (check_worker.joinable()) check_worker.join();
+
+    bool detected_dmr = false;
+    bool detected_monotonic = false;
+    bool detected_avg_increase = false;
+    int first_dmr_iter = -1;
+    int first_monotonic_iter = -1;
+    int first_avg_increase_iter = -1;
+    int checked_iteration_count = 0;
+    bool have_previous_avg_delta = false;
+    double previous_avg_delta = 0.0;
+
+    for (int check_iter = 1; check_iter <= iter; ++check_iter) {
+        int local_done = check_results[check_iter].done ? 1 : 0;
+        int all_done = 0;
+        MPI_Allreduce(&local_done, &all_done, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        if (!all_done) continue;
+        ++checked_iteration_count;
+
+        unsigned long long local_sum = check_results[check_iter].sum_abs_delta;
+        unsigned long long global_sum = 0;
+        int local_count = check_results[check_iter].count_update;
+        int global_count = 0;
+        int local_dmr = check_results[check_iter].dmr_error ? 1 : 0;
+        int global_dmr = 0;
+        int local_monotonic = check_results[check_iter].monotonic_error ? 1 : 0;
+        int global_monotonic = 0;
+
+        MPI_Allreduce(
+            &local_sum, &global_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_count, &global_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_dmr, &global_dmr, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+        MPI_Allreduce(
+            &local_monotonic, &global_monotonic, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+
+        if (global_dmr) {
+            detected_dmr = true;
+            if (first_dmr_iter < 0) first_dmr_iter = check_iter;
+        }
+        if (global_monotonic) {
+            detected_monotonic = true;
+            if (first_monotonic_iter < 0) first_monotonic_iter = check_iter;
+        }
+        if (global_count > 0) {
+            double average_delta = (double)global_sum / (double)global_count;
+            if (have_previous_avg_delta && average_delta > previous_avg_delta) {
+                detected_avg_increase = true;
+                if (first_avg_increase_iter < 0) first_avg_increase_iter = check_iter;
+            }
+            previous_avg_delta = average_delta;
+            have_previous_avg_delta = true;
+        }
+    }
 
     std::vector<int> h_owned(part.owned_count);
     CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(int), cudaMemcpyDeviceToHost));
@@ -289,13 +522,32 @@ inline void kcoreMultiGPU(
                    h_value, counts.data(), displs.data(), MPI_INT, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("异步CPU检测(KCore): DMR=%d, monotonic=%d, avg_delta_increase=%d\n", global_dmr, global_monotonic, global_avg_increase);
-        printf("GPU time: %.4f ms\n", ms);
+        printf("异步CPU检测(KCore): DMR=%d", detected_dmr ? 1 : 0);
+        if (first_dmr_iter >= 0) printf("(first_iter=%d)", first_dmr_iter);
+        printf(", monotonic=%d", detected_monotonic ? 1 : 0);
+        if (first_monotonic_iter >= 0) {
+            printf("(first_iter=%d)", first_monotonic_iter);
+        }
+        printf(", avg_delta_increase=%d", detected_avg_increase ? 1 : 0);
+        if (first_avg_increase_iter >= 0) {
+            printf("(first_iter=%d)", first_avg_increase_iter);
+        }
+        printf("\n");
+        printf("异步检测覆盖(KCore): checked=%d/%d, skipped=%d\n",
+               checked_iteration_count, iter, iter - checked_iteration_count);
+        printf("GPU time: %.4f ms\n", max_ms);
         printf("NCCL 分布式 KCore 容错版本迭代 %d 次结束。\n", iter);
     }
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
+    for (int buffer = 0; buffer < KCORE_CHECK_BUFFER_COUNT; ++buffer) {
+        cudaFree(d_check_info[buffer]);
+        cudaFreeHost(h_check_info[buffer]);
+        cudaEventDestroy(compute_done_events[buffer]);
+        cudaEventDestroy(check_done_events[buffer]);
+    }
+    CUDA_CHECK(cudaStreamDestroy(check_stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
     dg_free_peer_plans(plans);
     cudaFree(d_values);
@@ -307,8 +559,8 @@ inline void kcoreMultiGPU(
     cudaFree(d_active);
     cudaFree(d_update);
     cudaFree(d_active_count);
-    cudaFree(d_check_info);
+    cudaFree(d_check_info_scratch);
     NCCL_CHECK(ncclCommDestroy(comm));
 }
 
-#endif
+#endif  // KCORE_TOLERANCE_MULTIGPU_CUH

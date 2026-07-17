@@ -1,3 +1,7 @@
+/**
+ * @file spsc_queue.h
+ * @brief Bounded lock-free queue for one producer and one consumer.
+ */
 #ifndef GRAPH_ALGORITHM_SPSC_QUEUE_H
 #define GRAPH_ALGORITHM_SPSC_QUEUE_H
 
@@ -5,14 +9,21 @@
 #include <atomic>
 #include <cstddef>
 
-// Single-producer single-consumer bounded queue.
-// Capacity is the number of usable elements; one extra slot is kept internally
-// to distinguish full from empty.
+/**
+ * @brief Fixed-capacity single-producer/single-consumer queue.
+ * @tparam T Element type.
+ * @tparam Capacity Number of usable elements.
+ *
+ * One extra storage slot distinguishes full from empty. Release/acquire pairs
+ * publish entries without locks. The class is correct only when exactly one
+ * thread calls producer operations and exactly one calls consumer operations.
+ */
 template <typename T, std::size_t Capacity>
 class SpscQueue {
 public:
     static_assert(Capacity > 0, "SpscQueue capacity must be positive");
 
+    /** @brief Enqueue @p value, returning false immediately when full. */
     bool try_push(const T& value) {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
         const std::size_t next_tail = increment(tail);
@@ -24,6 +35,7 @@ public:
         return true;
     }
 
+    /** @brief Dequeue into @p value, returning false immediately when empty. */
     bool try_pop(T& value) {
         const std::size_t head = head_.load(std::memory_order_relaxed);
         if (head == tail_.load(std::memory_order_acquire)) {
@@ -34,6 +46,7 @@ public:
         return true;
     }
 
+    /** @brief Read the oldest element without removing it. */
     bool peek(T& value) const {
         const std::size_t head = head_.load(std::memory_order_relaxed);
         if (head == tail_.load(std::memory_order_acquire)) {
@@ -43,6 +56,7 @@ public:
         return true;
     }
 
+    /** @brief Return whether the consumer currently observes an empty queue. */
     bool empty() const {
         return head_.load(std::memory_order_acquire) ==
                tail_.load(std::memory_order_acquire);

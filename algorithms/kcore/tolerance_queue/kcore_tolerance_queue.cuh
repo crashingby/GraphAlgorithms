@@ -1,3 +1,7 @@
+/**
+ * @file kcore_tolerance_queue.cuh
+ * @brief Single-GPU k-core with selective DMR and asynchronous CPU checks.
+ */
 #include <cuda_runtime.h>
 #include <nvToolsExt.h>
 #include <stdio.h>
@@ -24,12 +28,14 @@
 } while (0)
 #endif
 
+/** @brief Expected direction of a vertex value across iterations. */
 enum ValueTrend {
     TREND_NONE = 0,
     TREND_INC = 1,
     TREND_DEC = 2
 };
 
+/** @brief Queue item binding an iteration to a reusable check buffer. */
 struct CheckTask {
     int iter = 0;
     int buf = -1;
@@ -48,6 +54,7 @@ inline std::string nvtx_name(const char* label, int iter) {
     return std::string(buf);
 }
 
+/** @brief Return the maximum outgoing degree used to normalize criticality. */
 inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     int max_outdegree = 1;
     for (int v = 0; v < num_nodes; ++v) {
@@ -57,6 +64,7 @@ inline int compute_max_outdegree(const int* h_row_offsets, int num_nodes) {
     return max_outdegree;
 }
 
+/** @brief Count active vertices and classify ordinary versus critical work. */
 __global__ void scoreAndMarkIntKernel(
     int* d_active,
     const int* d_values,
@@ -80,6 +88,7 @@ __global__ void scoreAndMarkIntKernel(
 }
 
 
+/** @brief Per-iteration device summary copied to a reusable host buffer. */
 struct MonotonicInfo {
     int dmr_error_flag;
     int monotonic_error_flag;
@@ -87,6 +96,7 @@ struct MonotonicInfo {
     int count_update;
 };
 
+/** @brief Host-side interpretation of one completed check summary. */
 struct AsyncCheckResult {
     bool done = false;
     unsigned long long sum_abs_delta = 0;
@@ -95,6 +105,10 @@ struct AsyncCheckResult {
     int monotonic_error = 0;
 };
 
+/**
+ * @brief Peel vertices and selectively duplicate critical degree recounts.
+ * @note Detected DMR or monotonic faults are reported only; state is not repaired.
+ */
 __global__ void kcorePullDualKernel(
     int* d_values,
     int* d_alive,
@@ -173,6 +187,13 @@ __global__ void kcorePullDualKernel(
         }
     }
 }
+/**
+ * @brief Execute k-core with a producer/consumer asynchronous check pipeline.
+ *
+ * The GPU producer writes per-iteration summaries into reusable buffers. A
+ * background CPU consumer polls events, evaluates anomaly signals, and returns
+ * buffers while graph iterations continue.
+ */
 void kcoreGPU(
     int* h_value,
     const int* h_row_offsets,

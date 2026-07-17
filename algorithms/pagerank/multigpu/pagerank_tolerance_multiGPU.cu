@@ -1,3 +1,7 @@
+/**
+ * @file pagerank_tolerance_multiGPU.cu
+ * @brief MPI entry point and CPU oracle for checked distributed PageRank.
+ */
 #include "pagerank_tolerance_multiGPU.cuh"
 
 #include <mpi.h>
@@ -16,6 +20,7 @@ constexpr float kPrAlpha = 0.85f;
 constexpr float kPrTol = 1e-3f;
 constexpr float kCheckTol = 1e-2f;
 
+/** @brief Compute the normalization denominator for criticality scoring. */
 int computeMaxOutdegree(const CsrGraph& graph) {
     int max_outdegree = 1;
     for (int v = 0; v < graph.nodes; ++v) {
@@ -25,6 +30,7 @@ int computeMaxOutdegree(const CsrGraph& graph) {
     return max_outdegree;
 }
 
+/** @brief Apply the GPU criticality formula to the CPU reference work set. */
 int scoreAndMarkCPU(std::vector<int>& active,
                     const std::vector<float>& value,
                     const CsrGraph& graph,
@@ -44,6 +50,7 @@ int scoreAndMarkCPU(std::vector<int>& active,
     return active_count;
 }
 
+/** @brief Run the serial reference using the same active-set PageRank formula. */
 void pagerankCPU(const CsrGraph& graph,
                  float* out,
                  float alpha,
@@ -83,6 +90,7 @@ void pagerankCPU(const CsrGraph& graph,
     for (int i = 0; i < n; ++i) out[i] = value[i];
 }
 
+/** @brief Compare CPU and GPU rank values with the project tolerance. */
 bool correctTest(int n, const float* ref, const float* gpu) {
     bool pass = true;
     int nerr = 0;
@@ -100,12 +108,22 @@ bool correctTest(int n, const float* ref, const float* gpu) {
 }
 } // namespace
 
+/** @brief Parse CLI options and coordinate checked distributed PageRank. */
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
     int rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(stderr, "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = true;

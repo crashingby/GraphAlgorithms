@@ -1,3 +1,7 @@
+/**
+ * @file cc_multiGPU_basic.cuh
+ * @brief MPI/NCCL rank-per-GPU CC baseline without fault detection.
+ */
 #ifndef CC_MULTIGPU_BASIC_CUH
 #define CC_MULTIGPU_BASIC_CUH
 
@@ -11,6 +15,12 @@
 
 #include "include/distributed_partition.cuh"
 
+/**
+ * @brief Propagate maximum labels for owned active vertices.
+ * @param values Owned-plus-ghost label cache.
+ * @param active Work set for owned vertices only; -1 means inactive.
+ * @param update Next work set over owned and ghost vertices.
+ */
 __global__ void ccDistributedPullKernel(
     int* values,
     const int* row_offsets,
@@ -45,6 +55,12 @@ __global__ void ccDistributedPullKernel(
     }
 }
 
+/**
+ * @brief Execute distributed maximum-label propagation without checks.
+ *
+ * NCCL communicates remote activations and ghost labels after every sparse
+ * iteration; MPI supplies global termination and final result assembly.
+ */
 inline void ccMultiGPUBasic(
     int* h_value,
     const int* h_row_offsets,

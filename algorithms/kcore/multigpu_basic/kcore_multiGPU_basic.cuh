@@ -1,3 +1,7 @@
+/**
+ * @file kcore_multiGPU_basic.cuh
+ * @brief MPI/NCCL rank-per-GPU k-core baseline without fault detection.
+ */
 #ifndef KCORE_MULTIGPU_BASIC_CUH
 #define KCORE_MULTIGPU_BASIC_CUH
 
@@ -11,6 +15,13 @@
 
 #include "include/distributed_partition.cuh"
 
+/**
+ * @brief Recount live neighbors and peel owned vertices below @p k.
+ * @param values Owned-plus-ghost remaining-degree estimates.
+ * @param alive Owned-plus-ghost live/dead cache.
+ * @param active Work set for owned vertices only; -1 means inactive.
+ * @param update Next work set over owned and ghost vertices.
+ */
 __global__ void kcoreDistributedPullKernel(
     int* values,
     int* alive,
@@ -43,6 +54,12 @@ __global__ void kcoreDistributedPullKernel(
     }
 }
 
+/**
+ * @brief Execute distributed k-core peeling without resilience checks.
+ *
+ * Remote deletion effects travel as activation flags while ghost @c alive
+ * values are refreshed through NCCL after each iteration.
+ */
 inline void kcoreMultiGPUBasic(
     int* h_value,
     const int* h_row_offsets,

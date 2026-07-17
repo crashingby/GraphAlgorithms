@@ -1,3 +1,7 @@
+/**
+ * @file cc_tolerance_multiGPU.cu
+ * @brief MPI entry point and optional CPU oracle for checked distributed CC.
+ */
 #include "cc_tolerance_multiGPU.cuh"
 
 #include <mpi.h>
@@ -9,6 +13,7 @@
 #include "include/output.h"
 #include "include/cli_options.h"
 
+/** @brief Run the serial maximum-label reference iteration. */
 void ccCPU(const CsrGraph& graph, int* value) {
     const int n = graph.nodes;
     for (int i = 0; i < n; ++i) value[i] = i;
@@ -27,6 +32,7 @@ void ccCPU(const CsrGraph& graph, int* value) {
     }
 }
 
+/** @brief Compare CPU and distributed GPU labels element by element. */
 bool correctTest(int n, const int* ref, const int* gpu) {
     bool pass = true;
     int nerr = 0;
@@ -40,12 +46,22 @@ bool correctTest(int n, const int* ref, const int* gpu) {
     return pass;
 }
 
+/** @brief Parse CLI options and coordinate the checked distributed CC run. */
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
     int rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(stderr, "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = true;

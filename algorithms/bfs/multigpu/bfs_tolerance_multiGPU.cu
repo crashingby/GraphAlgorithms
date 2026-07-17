@@ -1,3 +1,7 @@
+/**
+ * @file bfs_tolerance_multiGPU.cu
+ * @brief MPI entry point and optional CPU oracle for checked distributed BFS.
+ */
 #include "bfs_tolerance_multiGPU.cuh"
 #include <mpi.h>
 #include <stdio.h>
@@ -16,9 +20,12 @@
 
 #define INF 100000
 
-//-----------------------------
-// CPU BFS 单源最短路径（无权图）
-//-----------------------------
+/**
+ * @brief Compute an exact CPU BFS result for optional validation.
+ * @param graph Input graph in outgoing CSR form.
+ * @param dist Output distance array.
+ * @param src Source vertex.
+ */
 void bfsCPU(const CsrGraph &graph, int* dist, int src)
 {
     const int n = graph.nodes;
@@ -41,9 +48,7 @@ void bfsCPU(const CsrGraph &graph, int* dist, int src)
     }
 }
 
-//-----------------------------
-// CPU/GPU 结果正确性检测
-//-----------------------------
+/** @brief Compare CPU and distributed GPU distances element by element. */
 bool correctTest(int n, const int* ref, const int* gpu)
 {
     bool pass = true;
@@ -59,13 +64,23 @@ bool correctTest(int n, const int* ref, const int* gpu)
     return pass;
 }
 
+/** @brief Initialize funneled MPI and run checked distributed BFS. */
 int main(int argc, char **argv)
 {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
     int world_rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (world_rank == 0) {
+            fprintf(stderr, "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = true;

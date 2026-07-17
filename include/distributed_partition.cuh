@@ -1,3 +1,12 @@
+/**
+ * @file distributed_partition.cuh
+ * @brief Shared contiguous partitioning and NCCL exchange utilities.
+ *
+ * Every MPI rank owns a contiguous global vertex range. Remote predecessors or
+ * successors referenced by the owned subgraph are appended as ghost vertices.
+ * Precomputed peer plans map sparse activation flags and owned values between
+ * local indices on communicating ranks.
+ */
 #ifndef GRAPH_DISTRIBUTED_PARTITION_CUH
 #define GRAPH_DISTRIBUTED_PARTITION_CUH
 
@@ -36,6 +45,7 @@
 } while (0)
 #endif
 
+/** @brief Host description of one owned-plus-ghost graph partition. */
 struct DgSubgraphHost {
     int rank = 0;
     int start_node = 0;
@@ -52,6 +62,12 @@ struct DgSubgraphHost {
     std::vector<int> ghost_global_ids;
 };
 
+/**
+ * @brief Host-side sparse index plan for communication with one peer.
+ *
+ * Activation indices propagate remote work to the owner. Value indices refresh
+ * ghost caches from the owner after each graph iteration.
+ */
 struct DgPeerPlanHost {
     std::vector<int> act_send_local;
     std::vector<int> act_recv_owned;
@@ -59,6 +75,7 @@ struct DgPeerPlanHost {
     std::vector<int> value_recv_ghost;
 };
 
+/** @brief Device indices and staging buffers corresponding to a peer plan. */
 struct DgPeerPlanDevice {
     int act_send_count = 0;
     int act_recv_count = 0;
@@ -111,6 +128,13 @@ inline int dg_get_or_add_local(DgSubgraphHost& p, int global_v, bool owned) {
     return local;
 }
 
+/**
+ * @brief Build one rank partition from the complete outgoing and incoming CSR.
+ * @param rank Partition rank to build.
+ * @param world_size Number of MPI ranks.
+ * @param num_nodes Global vertex count.
+ * @param p Output partition; owned vertices precede all ghosts.
+ */
 inline void dg_build_subgraph(
     int rank,
     int world_size,
@@ -199,6 +223,11 @@ inline void dg_build_all_subgraphs(
     }
 }
 
+/**
+ * @brief Derive pairwise activation and ghost-value exchange plans.
+ * @param parts Partition descriptions for every rank.
+ * @param plans Output matrix indexed as sender rank then peer rank.
+ */
 inline void dg_build_peer_plans(
     const std::vector<DgSubgraphHost>& parts,
     int world_size,
@@ -358,6 +387,11 @@ inline int dg_blocks(int n) {
     return (n + DG_BLOCK_SIZE - 1) / DG_BLOCK_SIZE;
 }
 
+/**
+ * @brief Exchange sparse remote activation flags and apply them at each owner.
+ * @param d_update Local update array spanning owned and ghost indices.
+ * @param d_next_active Owned-only work set receiving local and remote updates.
+ */
 inline void dg_nccl_exchange_activation(
     int* d_update,
     int* d_next_active,
@@ -421,6 +455,7 @@ inline void dg_nccl_exchange_activation(
     }
 }
 
+/** @brief Refresh integer-valued ghost caches using precomputed peer plans. */
 inline void dg_nccl_exchange_int_values(
     int* d_values,
     std::vector<DgPeerPlanDevice>& plans,
@@ -483,6 +518,7 @@ inline void dg_nccl_exchange_int_values(
     }
 }
 
+/** @brief Refresh floating-point ghost caches using precomputed peer plans. */
 inline void dg_nccl_exchange_float_values(
     float* d_values,
     std::vector<DgPeerPlanDevice>& plans,
@@ -545,6 +581,7 @@ inline void dg_nccl_exchange_float_values(
     }
 }
 
+/** @brief Bind each node-local MPI rank to one visible CUDA device. */
 inline int dg_select_rank_device() {
     int local_rank = 0;
     int local_size = 1;
@@ -571,6 +608,7 @@ inline int dg_select_rank_device() {
     return device;
 }
 
+/** @brief Create one NCCL communicator spanning all MPI ranks. */
 inline ncclComm_t dg_create_nccl_comm(int rank, int world_size) {
     ncclUniqueId id;
     if (rank == 0) NCCL_CHECK(ncclGetUniqueId(&id));

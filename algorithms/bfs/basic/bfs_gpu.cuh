@@ -1,3 +1,10 @@
+/**
+ * @file bfs_gpu.cuh
+ * @brief Single-GPU pull-based BFS baseline.
+ *
+ * Active vertices pull distances from incoming neighbors. A successful
+ * relaxation marks outgoing neighbors for the next iteration.
+ */
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,7 +12,12 @@
 #define BLOCK_SIZE 256
 #define INF 100000  
 
-// ==================== GPU BFS 拉模式核函数 ====================
+/**
+ * @brief Relax active vertices and build the next sparse work set.
+ * @param d_values Current shortest-distance estimates.
+ * @param d_active Current work-set bitmap; zero means inactive.
+ * @param d_update Next-iteration work-set bitmap.
+ */
 __global__ void bfsPullKernel(
     int* d_values,
     const int* d_row_offsets,
@@ -41,7 +53,7 @@ __global__ void bfsPullKernel(
 
 }
 
-// ==================== GPU 统计活跃顶点 ====================
+/** @brief Count nonzero entries in the current work set. */
 __global__ void countActiveKernel(
     const int* d_active,
     int* d_num_active,
@@ -53,7 +65,21 @@ __global__ void countActiveKernel(
     }
 }
 
-// ==================== GPU BFS 主函数 ====================
+/**
+ * @brief Execute the single-GPU BFS baseline until the work set is empty.
+ * @param h_value Host output array of length @p num_nodes.
+ * @param h_row_offsets Host outgoing CSR row offsets.
+ * @param h_column_indices Host outgoing CSR destinations.
+ * @param h_column_offsets Host incoming CSR column offsets.
+ * @param h_row_indices Host incoming CSR sources.
+ * @param num_nodes Number of vertices.
+ * @param num_edges Number of directed edges.
+ * @param src Source vertex identifier.
+ *
+ * The implementation updates distances in place and therefore preserves the
+ * existing asynchronous-relaxation semantics rather than level-synchronous
+ * frontier semantics.
+ */
 void bfsGPU(
     int* h_value,
     const int* h_row_offsets,

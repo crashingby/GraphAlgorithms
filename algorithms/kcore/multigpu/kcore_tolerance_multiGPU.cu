@@ -1,3 +1,7 @@
+/**
+ * @file kcore_tolerance_multiGPU.cu
+ * @brief MPI entry point and CPU oracle for checked distributed k-core.
+ */
 #include "kcore_tolerance_multiGPU.cuh"
 
 #include <mpi.h>
@@ -10,6 +14,13 @@
 #include "include/output.h"
 #include "include/cli_options.h"
 
+/**
+ * @brief Compute a serial KCore peeling reference for result validation.
+ *
+ * @param graph Host CSR graph.
+ * @param[out] value Final residual degree for every vertex.
+ * @param k Requested KCore threshold.
+ */
 void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     const int n = graph.nodes;
     std::vector<int8_t> alive(n, 1);
@@ -33,6 +44,14 @@ void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     }
 }
 
+/**
+ * @brief Compare distributed GPU output with the serial KCore classification.
+ *
+ * Residual degree values below @p k are equivalent because both classify the
+ * vertex as peeled; values on opposite sides of @p k are reported as errors.
+ *
+ * @return true when every vertex has an equivalent KCore classification.
+ */
 bool correctTest(int n, const int* ref, const int* gpu, int k) {
     bool pass = true;
     int nerr = 0;
@@ -46,12 +65,27 @@ bool correctTest(int n, const int* ref, const int* gpu, int k) {
     return pass;
 }
 
+/**
+ * @brief MPI command-line entry point for fault-detecting multi-GPU KCore.
+ *
+ * Rank zero optionally validates and writes the globally assembled result;
+ * all ranks participate in graph loading, KCore execution, and MPI teardown.
+ */
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
     int rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(stderr, "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = true;

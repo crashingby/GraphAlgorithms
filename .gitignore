@@ -5,3 +5,4 @@ info_outcome.txt
 outputs
 .vscode/
 temp_downloads/
+.venv
