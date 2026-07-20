@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TEMP = ROOT / "temp_downloads"
 DEFAULT_DATASET_DIR = ROOT / "dataset"
 
@@ -451,7 +451,7 @@ def run_stats(dataset_names: list[str], output_md: Path, timeout: int | None) ->
     ]
 
     for name in dataset_names:
-        cmd = [sys.executable, str(ROOT / "utils" / "dataset_stats.py"), name]
+        cmd = [sys.executable, str(ROOT / "scripts" / "utils" / "dataset_stats.py"), name]
         log(f"[stats] {name}")
         row = {"dataset": name}
         try:

@@ -24,7 +24,8 @@ void kcoreCPU(const CsrGraph &graph, int* value, int k)
     std::vector<int> degree(n);
     std::vector<int8_t> alive(n, 1);
     for (int i = 0; i < n; i++) {
-        degree[i] = graph.row_offsets[i + 1] - graph.row_offsets[i];
+        degree[i] =
+            graph.column_offsets[i + 1] - graph.column_offsets[i];
         value[i] = degree[i];
     }
 

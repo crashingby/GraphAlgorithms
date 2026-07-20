@@ -10,12 +10,16 @@
 #include <nccl.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <mutex>
 #include <thread>
 #include <vector>
 
+#include "include/distributed_benchmark.cuh"
 #include "include/distributed_partition.cuh"
 #include "include/spsc_queue.h"
 
@@ -94,6 +98,10 @@ __global__ void ccDistributedScoreAndMarkKernel(
  * label delta used by the later CPU trend check. Only owned labels are written;
  * ghost labels remain read-only caches refreshed by NCCL after the kernel.
  *
+ * Active and assigned redundant lanes select an owned compute vertex before
+ * entering one common owned-plus-ghost pull loop. Role divergence is limited
+ * to target selection, result placement, comparison, and primary writeback.
+ *
  * @warning Block barriers do not create a grid-wide value snapshot. Other
  * blocks may update owned labels between primary and redundant reads, so a DMR
  * mismatch can occur without a hardware fault.
@@ -150,27 +158,34 @@ __global__ void ccDistributedToleranceKernel(
     __syncthreads();
 
     int old_value = valid ? values[tid] : 0;
-    int new_value = old_value;
+    const bool does_redundant_work =
+        idle && idle_id >= 0 && idle_id < critical_count &&
+        idle_id < DG_BLOCK_SIZE;
+    int compute_vertex = -1;
     if (is_active) {
-        for (int e = column_offsets[tid]; e < column_offsets[tid + 1]; ++e) {
+        compute_vertex = tid;
+    } else if (does_redundant_work) {
+        compute_vertex = critical_list[idle_id];
+    }
+
+    int computed_value = 0;
+    if (compute_vertex >= 0) {
+        computed_value = values[compute_vertex];
+        for (int e = column_offsets[compute_vertex];
+             e < column_offsets[compute_vertex + 1]; ++e) {
             int src = row_indices[e];
-            if (src >= 0 && src < local_node_count && values[src] > new_value) {
-                new_value = values[src];
+            if (src >= 0 && src < local_node_count &&
+                values[src] > computed_value) {
+                computed_value = values[src];
             }
         }
     }
-    __syncthreads();
 
-    if (idle && idle_id < critical_count && idle_id < DG_BLOCK_SIZE) {
-        int target = critical_list[idle_id];
-        int redundant = values[target];
-        for (int e = column_offsets[target]; e < column_offsets[target + 1]; ++e) {
-            int src = row_indices[e];
-            if (src >= 0 && src < local_node_count && values[src] > redundant) {
-                redundant = values[src];
-            }
-        }
-        redundant_results[idle_id] = redundant;
+    int new_value = old_value;
+    if (is_active) {
+        new_value = computed_value;
+    } else if (does_redundant_work) {
+        redundant_results[idle_id] = computed_value;
     }
     __syncthreads();
 
@@ -334,48 +349,55 @@ inline void ccMultiGPU(
     }
 
     std::atomic<bool> stop_check_worker(false);
+    std::mutex pending_mutex;
+    std::condition_variable pending_cv;
     std::vector<CcAsyncCheckResult> check_results(1001);
+
+    // Sleep while no task exists, then block in CUDA until the oldest D2H copy
+    // completes. This avoids a polling thread stealing CPU time from MPI.
     std::thread check_worker([&]() {
         CUDA_CHECK(cudaSetDevice(device));
-        while (!stop_check_worker.load(std::memory_order_relaxed) || !pending_tasks.empty()) {
-            bool progressed = false;
+        while (true) {
             CcAsyncCheckTask task;
-            if (pending_tasks.peek(task)) {
-                cudaError_t event_status = cudaEventQuery(check_done_events[task.buffer]);
-                if (event_status == cudaSuccess) {
-                    pending_tasks.try_pop(task);
-
-                    CcAsyncCheckResult result;
-                    result.done = true;
-                    result.dmr_error = h_check_info[task.buffer]->dmr_error_flag;
-                    result.monotonic_error =
-                        h_check_info[task.buffer]->monotonic_error_flag;
-                    result.sum_abs_delta = h_check_info[task.buffer]->sum_abs_delta;
-                    result.count_update = h_check_info[task.buffer]->count_update;
-                    if (task.iter >= 0 && task.iter < (int)check_results.size()) {
-                        check_results[task.iter] = result;
-                    }
-
-                    free_buffers.try_push(task.buffer);
-                    progressed = true;
-                } else if (event_status != cudaErrorNotReady) {
-                    CUDA_CHECK(event_status);
+            {
+                std::unique_lock<std::mutex> lock(pending_mutex);
+                pending_cv.wait(lock, [&]() {
+                    return stop_check_worker.load(std::memory_order_acquire) ||
+                           !pending_tasks.empty();
+                });
+                if (stop_check_worker.load(std::memory_order_acquire) &&
+                    pending_tasks.empty()) {
+                    break;
                 }
+                if (!pending_tasks.try_pop(task)) continue;
             }
-            if (!progressed) std::this_thread::yield();
+
+            CUDA_CHECK(cudaEventSynchronize(check_done_events[task.buffer]));
+            CcAsyncCheckResult result;
+            result.done = true;
+            result.dmr_error = h_check_info[task.buffer]->dmr_error_flag;
+            result.monotonic_error =
+                h_check_info[task.buffer]->monotonic_error_flag;
+            result.sum_abs_delta = h_check_info[task.buffer]->sum_abs_delta;
+            result.count_update = h_check_info[task.buffer]->count_update;
+            if (task.iter >= 0 && task.iter < (int)check_results.size()) {
+                check_results[task.iter] = result;
+            }
+            free_buffers.try_push(task.buffer);
         }
     });
 
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start, stream));
-
+    DgIterationPhaseTimer phase_timer;
+    GraphCudaEventAccumulator graph_kernel_timer;
+    CUDA_CHECK(graph_cuda_timer_create(&graph_kernel_timer));
+    DgBenchmarkTiming timing;
     int iter = 0;
     int total_active = num_nodes;
+    const auto main_loop_start = std::chrono::steady_clock::now();
 
     while (iter < 1000 && total_active > 0) {
         ++iter;
+        phase_timer.start_pre(stream);
         int check_buffer = -1;
         bool do_async_check = free_buffers.try_pop(check_buffer);
         CcDistributedCheckInfo* iteration_check_info = do_async_check
@@ -390,11 +412,13 @@ inline void ccMultiGPU(
 
         CUDA_CHECK(cudaMemsetAsync(
             iteration_check_info, 0, sizeof(CcDistributedCheckInfo), stream));
+        CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, stream));
         ccDistributedToleranceKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
             d_values, d_row_offsets, d_column_indices, d_column_offsets, d_row_indices,
             d_active, d_update, part.owned_count, part.local_node_count,
             iteration_check_info);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, stream));
 
         CUDA_CHECK(cudaMemsetAsync(d_active, 0xff, part.owned_count * sizeof(int), stream));
         dgCopyOwnedUpdateKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
@@ -414,14 +438,23 @@ inline void ccMultiGPU(
                 cudaMemcpyDeviceToHost,
                 check_stream));
             CUDA_CHECK(cudaEventRecord(check_done_events[check_buffer], check_stream));
-            while (!pending_tasks.try_push({iter, check_buffer})) {
-                std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex);
+                if (!pending_tasks.try_push({iter, check_buffer})) {
+                    fprintf(stderr, "CC async check queue invariant failed.\n");
+                    exit(EXIT_FAILURE);
+                }
             }
+            pending_cv.notify_one();
         }
+        phase_timer.stop_pre(stream);
 
+        phase_timer.start_comm(stream);
         dg_nccl_exchange_activation(d_update, d_active, plans, world_size, rank, comm, stream);
         dg_nccl_exchange_int_values(d_values, plans, world_size, rank, comm, stream);
+        phase_timer.stop_comm(stream);
 
+        phase_timer.start_post(stream);
         CUDA_CHECK(cudaMemsetAsync(d_update, 0xff, part.local_node_count * sizeof(int), stream));
         CUDA_CHECK(cudaMemsetAsync(d_active_count, 0, sizeof(int), stream));
         dgCountActiveKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
@@ -429,24 +462,35 @@ inline void ccMultiGPU(
         CUDA_CHECK(cudaGetLastError());
 
         int local_active = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&local_active, d_active_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            &local_active, d_active_count, sizeof(int),
+            cudaMemcpyDeviceToHost, stream));
+        phase_timer.stop_post(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        phase_timer.accumulate(timing.gpu_compute_ms, timing.nccl_exchange_ms);
+        CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
 
-        MPI_Allreduce(&local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        dg_timed_allreduce(
+            &local_active, &total_active, 1, MPI_INT, MPI_SUM,
+            MPI_COMM_WORLD, timing.mpi_sync_ms);
     }
 
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    float max_ms = 0.0f;
-    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+    timing.main_loop_ms = dg_elapsed_ms(
+        main_loop_start, std::chrono::steady_clock::now());
 
-    // The program requests MPI_THREAD_FUNNELED rather than THREAD_MULTIPLE, so
-    // every collective remains on this main thread.
-    while (!pending_tasks.empty()) std::this_thread::yield();
-    stop_check_worker.store(true, std::memory_order_release);
+    // Only unfinished checker work belongs to the drain phase. Detection-result
+    // collectives are measured separately below.
+    const auto drain_start = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        stop_check_worker.store(true, std::memory_order_release);
+    }
+    pending_cv.notify_one();
     if (check_worker.joinable()) check_worker.join();
+    timing.cpu_check_drain_ms = dg_elapsed_ms(
+        drain_start, std::chrono::steady_clock::now());
+
+    const auto postcheck_start = std::chrono::steady_clock::now();
 
     bool detected_dmr = false;
     bool detected_monotonic = false;
@@ -461,7 +505,9 @@ inline void ccMultiGPU(
     for (int check_iter = 1; check_iter <= iter; ++check_iter) {
         int local_done = check_results[check_iter].done ? 1 : 0;
         int all_done = 0;
-        MPI_Allreduce(&local_done, &all_done, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        dg_timed_allreduce(
+            &local_done, &all_done, 1, MPI_INT, MPI_MIN,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
         if (!all_done) continue;
         ++checked_iteration_count;
 
@@ -474,16 +520,18 @@ inline void ccMultiGPU(
         int local_monotonic = check_results[check_iter].monotonic_error ? 1 : 0;
         int global_monotonic = 0;
 
-        MPI_Allreduce(
+        dg_timed_allreduce(
             &local_sum, &global_sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
-            MPI_COMM_WORLD);
-        MPI_Allreduce(
-            &local_count, &global_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(
-            &local_dmr, &global_dmr, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-        MPI_Allreduce(
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
+        dg_timed_allreduce(
+            &local_count, &global_count, 1, MPI_INT, MPI_SUM,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
+        dg_timed_allreduce(
+            &local_dmr, &global_dmr, 1, MPI_INT, MPI_LOR,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
+        dg_timed_allreduce(
             &local_monotonic, &global_monotonic, 1, MPI_INT, MPI_LOR,
-            MPI_COMM_WORLD);
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
 
         if (global_dmr) {
             detected_dmr = true;
@@ -507,6 +555,11 @@ inline void ccMultiGPU(
         }
     }
 
+    timing.postcheck_total_ms = dg_elapsed_ms(
+        postcheck_start, std::chrono::steady_clock::now());
+    timing.graph_kernel_ms = graph_kernel_timer.total_ms;
+    dg_report_benchmark_timing(timing, rank, world_size);
+
     std::vector<int> h_owned(part.owned_count);
     CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(int), cudaMemcpyDeviceToHost));
     std::vector<int> counts = dg_owned_counts(world_size, num_nodes);
@@ -529,12 +582,12 @@ inline void ccMultiGPU(
         }
         printf("异步检测覆盖(CC): checked=%d/%d, skipped=%d\n",
                checked_iteration_count, iter, iter - checked_iteration_count);
-        printf("GPU time: %.4f ms\n", max_ms);
         printf("NCCL 分布式 CC 容错版本迭代 %d 次结束。\n", iter);
+        printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
     }
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    phase_timer.destroy();
+    CUDA_CHECK(graph_cuda_timer_destroy(&graph_kernel_timer));
     CUDA_CHECK(cudaStreamDestroy(check_stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
     dg_free_peer_plans(plans);

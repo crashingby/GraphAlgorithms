@@ -7,11 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <thread>
 #include <vector>
 #include "include/spsc_queue.h"
+#include "include/cuda_event_timer.cuh"
 
 #define BLOCK_SIZE 256
 #define INF 100000
@@ -108,6 +110,10 @@ struct AsyncCheckResult {
 /**
  * @brief Peel vertices and selectively duplicate critical degree recounts.
  * @note Detected DMR or monotonic faults are reported only; state is not repaired.
+ * @details Active and assigned redundant lanes select a compute vertex before
+ * entering one common incoming-neighbor recount. Role divergence is limited
+ * to target selection and result placement; only the primary lane performs
+ * authoritative writeback.
  */
 __global__ void kcorePullDualKernel(
     int* d_values,
@@ -143,23 +149,26 @@ __global__ void kcorePullDualKernel(
     __syncthreads();
 
     int oldVal = valid ? d_values[tid] : 0;
-    int mainVal = oldVal;
-    if (active) {
-        mainVal = 0;
-        for (int i = d_column_offsets[tid]; i < d_column_offsets[tid + 1]; ++i) {
+    const bool does_redundant_work =
+        idle && iid >= 0 && iid < critical_count && iid < BLOCK_SIZE;
+    int compute_vertex = -1;
+    if (active) compute_vertex = tid;
+    else if (does_redundant_work) compute_vertex = critical_list[iid];
+
+    int computed_value = 0;
+    if (compute_vertex >= 0) {
+        for (int i = d_column_offsets[compute_vertex];
+             i < d_column_offsets[compute_vertex + 1]; ++i) {
             int neighbor = d_row_indices[i];
-            if (d_alive[neighbor] != 0) mainVal++;
+            if (d_alive[neighbor] != 0) ++computed_value;
         }
     }
-    __syncthreads();
 
-    if (idle && iid < critical_count && iid < BLOCK_SIZE) {
-        int target = critical_list[iid];
-        int r = 0;
-        for (int i = d_column_offsets[target]; i < d_column_offsets[target + 1]; ++i) {
-            if (d_alive[d_row_indices[i]] != 0) r++;
-        }
-        redundant_results[iid] = r;
+    int mainVal = oldVal;
+    if (active) {
+        mainVal = computed_value;
+    } else if (does_redundant_work) {
+        redundant_results[iid] = computed_value;
     }
     __syncthreads();
     if (critical && cid >= 0 && cid < idle_count && cid < BLOCK_SIZE && redundant_results[cid] != mainVal) {
@@ -259,7 +268,8 @@ void kcoreGPU(
     }
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
+    GraphCudaEventAccumulator graph_kernel_timer;
+    CUDA_CHECK(graph_cuda_timer_create(&graph_kernel_timer));
 
     SpscQueue<int, CHECK_BUFFER_COUNT> free_buffers;
     SpscQueue<CheckTask, CHECK_BUFFER_COUNT> pending_tasks;
@@ -314,6 +324,7 @@ void kcoreGPU(
         }
     });
 
+    CUDA_CHECK(cudaEventRecord(start));
     int blocks = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int iter = 0;
     int active_nodes = num_nodes;
@@ -330,10 +341,12 @@ void kcoreGPU(
             bool do_async_check = free_buffers.try_pop(check_buf);
             MonotonicInfo* iter_info = do_async_check ? d_info[check_buf] : d_info_scratch;
             CUDA_CHECK(cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), compute_stream));
+            CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, compute_stream));
             kcorePullDualKernel<<<blocks, BLOCK_SIZE, 0, compute_stream>>>(
                 d_values, d_alive, d_ro, d_ci, d_co, d_ri, d_active, d_update,
                 num_nodes, k, iter_info, TREND_DEC
             );
+            CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, compute_stream));
             if (do_async_check) {
                 NvtxRange copy_range(nvtx_name("main enqueue check_stream D2H", iter));
                 CUDA_CHECK(cudaEventRecord(compute_done_event[check_buf], compute_stream));
@@ -352,6 +365,7 @@ void kcoreGPU(
         {
             NvtxRange sync_range(nvtx_name("main compute sync", iter));
             CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+            CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
         }
         {
             NvtxRange score_range(nvtx_name("main score active", iter));
@@ -368,16 +382,26 @@ void kcoreGPU(
         if (active_nodes == 0) break;
     }
 
-    while (!pending_tasks.empty()) std::this_thread::yield();
-    check_stop.store(true, std::memory_order_release);
-    check_worker.join();
-
     CUDA_CHECK(cudaMemcpy(h_value, d_values, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    const auto tail_start = std::chrono::steady_clock::now();
+    while (!pending_tasks.empty()) std::this_thread::yield();
+    check_stop.store(true, std::memory_order_release);
+    check_worker.join();
+    const double cpu_check_tail_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tail_start).count();
+
     printf("GPU time: %.4f ms\n", ms);
+    printf("BENCHMARK_TIMING gpu_main_ms=%.4f graph_kernel_ms=%.4f "
+           "cpu_check_tail_ms=%.4f "
+           "nccl_exchange_ms=0.0000 mpi_sync_ms=0.0000 communication_ms=0.0000\n",
+           ms, graph_kernel_timer.total_ms, cpu_check_tail_ms);
+    printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
 
     CUDA_CHECK(cudaFree(d_values)); CUDA_CHECK(cudaFree(d_alive)); CUDA_CHECK(cudaFree(d_ro)); CUDA_CHECK(cudaFree(d_ci));
     CUDA_CHECK(cudaFree(d_co)); CUDA_CHECK(cudaFree(d_ri)); CUDA_CHECK(cudaFree(d_active));
@@ -391,6 +415,7 @@ void kcoreGPU(
     CUDA_CHECK(cudaFree(d_info_scratch));
     CUDA_CHECK(cudaFreeHost(h_active));
     CUDA_CHECK(cudaFreeHost(h_alive));
+    CUDA_CHECK(graph_cuda_timer_destroy(&graph_kernel_timer));
     CUDA_CHECK(cudaStreamDestroy(check_stream));
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     CUDA_CHECK(cudaEventDestroy(start));

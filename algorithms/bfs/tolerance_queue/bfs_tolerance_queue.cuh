@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <nvToolsExt.h>
 #include "include/spsc_queue.h"
+#include "include/cuda_event_timer.cuh"
 
 #define BLOCK_SIZE 256
 #define INF 100000  
@@ -114,6 +115,10 @@ __global__ void scoreAndMarkKernel(
  * Active threads perform the primary pull. Idle lanes recompute as many
  * critical vertices as available capacity permits and report mismatches in
  * @p d_info. The kernel only detects faults; it does not repair values.
+ *
+ * Primary and assigned redundant lanes select a compute vertex before entering
+ * one shared neighbor loop. Role divergence is limited to target selection and
+ * result placement; only the primary lane performs authoritative writeback.
  */
 __global__ void bfsPullDualKernel(
     int* d_values,
@@ -161,34 +166,31 @@ __global__ void bfsPullDualKernel(
     }
     __syncthreads();
 
-    // ==================== 主线程计算（活跃线程） ====================
-    int oldVal = INF;
-    if (valid_tid) oldVal = d_values[tid];
-    int main_newVal = INF;
+    // Active and assigned redundant lanes share one pull path. Divergence is
+    // restricted to selecting the vertex and committing the result.
+    int oldVal = valid_tid ? d_values[tid] : INF;
+    const bool does_redundant_work =
+        is_idle && iid >= 0 && iid < critical_count && iid < BLOCK_SIZE;
+    int compute_vertex = -1;
+    if (is_active) compute_vertex = tid;
+    else if (does_redundant_work) compute_vertex = critical_list[iid];
 
-    if(is_active){
-        main_newVal = d_values[tid];
-        for (int i = d_column_offsets[tid]; i < d_column_offsets[tid + 1]; i++) {
+    int computed_value = INF;
+    if (compute_vertex >= 0) {
+        computed_value = d_values[compute_vertex];
+        for (int i = d_column_offsets[compute_vertex];
+             i < d_column_offsets[compute_vertex + 1]; ++i) {
             int dst = d_row_indices[i];
             int candidate = d_values[dst] + 1;
-            if(candidate < main_newVal) main_newVal = candidate;
+            if (candidate < computed_value) computed_value = candidate;
         }
     }
-    __syncthreads();
 
-    // ==================== 冗余计算（空闲线程执行） ====================
-    if(is_idle) {
-        int my_idle_id = iid;   // 本线程在 idle_list 的索引
-        if(my_idle_id < critical_count && my_idle_id < BLOCK_SIZE){
-            int target_tid = critical_list[my_idle_id];
-            int redundant_newVal = d_values[target_tid];
-            for (int i = d_column_offsets[target_tid]; i < d_column_offsets[target_tid + 1]; i++) {
-                int dst = d_row_indices[i];
-                int candidate = d_values[dst] + 1;
-                if(candidate < redundant_newVal) redundant_newVal = candidate;
-            }
-            redundant_results[my_idle_id] = redundant_newVal;  // 将冗余结果写入共享内存
-        }
+    int main_newVal = INF;
+    if (is_active) {
+        main_newVal = computed_value;
+    } else if (does_redundant_work) {
+        redundant_results[iid] = computed_value;
     }
     __syncthreads();
 
@@ -322,8 +324,9 @@ void bfsGPU(
     }
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+    GraphCudaEventAccumulator graph_kernel_timer;
+    graph_cuda_timer_create(&graph_kernel_timer);
 
-    cudaEventRecord(start);
 
     int iter = 0;
     SpscQueue<int, CHECK_BUFFER_COUNT> free_buffers;
@@ -392,6 +395,7 @@ void bfsGPU(
         }
     });
 
+    cudaEventRecord(start);
     int active_nodes = num_nodes;
     int num_blocks = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -415,6 +419,7 @@ void bfsGPU(
             cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), compute_stream);
 
             // 1. 启动计算
+            graph_cuda_timer_start(&graph_kernel_timer, compute_stream);
             bfsPullDualKernel<<<num_blocks, BLOCK_SIZE, 0, compute_stream>>>(
                 d_values, d_row_offsets, d_column_indices,
                 d_column_offsets, d_row_indices,
@@ -422,6 +427,7 @@ void bfsGPU(
                 iter_info, TREND_DEC
             );
 
+            graph_cuda_timer_stop(&graph_kernel_timer, compute_stream);
             if (do_async_check) {
                 NvtxRange copy_enqueue_range(nvtx_name("main enqueue check_stream D2H", iter));
                 cudaEventRecord(compute_done_event[check_buf], compute_stream);
@@ -444,6 +450,7 @@ void bfsGPU(
         {
             NvtxRange sync_range(nvtx_name("main compute sync", iter));
             cudaStreamSynchronize(compute_stream);
+            graph_cuda_timer_accumulate(&graph_kernel_timer);
         }
 
         {
@@ -464,19 +471,29 @@ void bfsGPU(
         if(active_nodes == 0) break;
     }
 
-    while (!pending_tasks.empty()) {
-        std::this_thread::yield();
-    }
-    check_stop.store(true, std::memory_order_release);
-    check_worker.join();
-
     cudaMemcpy(h_value, d_values, num_nodes*sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
+
+    const auto tail_start = std::chrono::steady_clock::now();
+    while (!pending_tasks.empty()) {
+        std::this_thread::yield();
+    }
+    check_stop.store(true, std::memory_order_release);
+    check_worker.join();
+    const double cpu_check_tail_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tail_start).count();
+
     printf("GPU time: %.4f ms\n", ms);
+    printf("BENCHMARK_TIMING gpu_main_ms=%.4f graph_kernel_ms=%.4f "
+           "cpu_check_tail_ms=%.4f "
+           "nccl_exchange_ms=0.0000 mpi_sync_ms=0.0000 communication_ms=0.0000\n",
+           ms, graph_kernel_timer.total_ms, cpu_check_tail_ms);
+    printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
 
     // ================= 释放资源 =================
     cudaFree(d_values); cudaFree(d_row_offsets); cudaFree(d_column_indices);
@@ -497,6 +514,7 @@ void bfsGPU(
         cudaEventDestroy(compute_done_event[i]);
         cudaEventDestroy(check_done_event[i]);
     }
+    graph_cuda_timer_destroy(&graph_kernel_timer);
     cudaStreamDestroy(check_stream);
     cudaStreamDestroy(compute_stream);
 

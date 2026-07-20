@@ -14,13 +14,30 @@
 #include "include/output.h"
 #include "include/cli_options.h"
 
+/**
+ * @brief Initialize the same FUNNELED MPI contract used by the checked build.
+ *
+ * Only the main thread calls MPI in either variant. Requesting the same thread
+ * level removes MPI initialization mode as an experimental confounder.
+ */
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
 
     int rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(
+                stderr,
+                "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = false;

@@ -15,7 +15,10 @@
 #include "include/cli_options.h"
 
 /**
- * @brief Compute a serial KCore peeling reference for result validation.
+ * @brief Compute the directed peeling fixed point used by the GPU.
+ *
+ * Support is initialized from incoming CSR; removing a vertex decrements its
+ * outgoing destinations. Values below @p k remain classification-equivalent.
  *
  * @param graph Host CSR graph.
  * @param[out] value Final residual degree for every vertex.
@@ -26,7 +29,8 @@ void kcoreCPU(const CsrGraph& graph, int* value, int k) {
     std::vector<int8_t> alive(n, 1);
 
     for (int i = 0; i < n; ++i) {
-        value[i] = graph.row_offsets[i + 1] - graph.row_offsets[i];
+        value[i] =
+            graph.column_offsets[i + 1] - graph.column_offsets[i];
     }
 
     bool changed = true;

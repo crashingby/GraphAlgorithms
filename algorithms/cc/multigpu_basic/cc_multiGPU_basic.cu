@@ -23,8 +23,9 @@ void ccCPU(const CsrGraph& graph, int* value) {
         changed = false;
         for (int u = 0; u < n; ++u) {
             int old = value[u];
-            for (int e = graph.row_offsets[u]; e < graph.row_offsets[u + 1]; ++e) {
-                int v = graph.column_indices[e];
+            for (int e = graph.column_offsets[u];
+                 e < graph.column_offsets[u + 1]; ++e) {
+                int v = graph.row_indices[e];
                 if (value[v] > value[u]) value[u] = value[v];
             }
             if (value[u] != old) changed = true;
@@ -45,13 +46,30 @@ bool correctTest(int n, const int* ref, const int* gpu) {
     return pass;
 }
 
+/**
+ * @brief Initialize the same FUNNELED MPI contract used by the checked build.
+ *
+ * Only the main thread calls MPI in either variant. Requesting the same thread
+ * level removes MPI initialization mode as an experimental confounder.
+ */
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    int provided_thread_level = MPI_THREAD_SINGLE;
+    MPI_Init_thread(
+        &argc, &argv, MPI_THREAD_FUNNELED, &provided_thread_level);
 
     int rank = 0;
     int world_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (provided_thread_level < MPI_THREAD_FUNNELED) {
+        if (rank == 0) {
+            fprintf(
+                stderr,
+                "MPI implementation does not provide MPI_THREAD_FUNNELED.\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        return 1;
+    }
 
     GraphCliOptions opts;
     opts.run_cpu = true;

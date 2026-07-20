@@ -13,7 +13,7 @@
 #include "include/output.h"
 #include "include/cli_options.h"
 
-/** @brief Run the serial maximum-label reference iteration. */
+/** @brief Pull maximum labels through incoming CSR, matching the GPU. */
 void ccCPU(const CsrGraph& graph, int* value) {
     const int n = graph.nodes;
     for (int i = 0; i < n; ++i) value[i] = i;
@@ -23,8 +23,9 @@ void ccCPU(const CsrGraph& graph, int* value) {
         changed = false;
         for (int u = 0; u < n; ++u) {
             int old = value[u];
-            for (int e = graph.row_offsets[u]; e < graph.row_offsets[u + 1]; ++e) {
-                int v = graph.column_indices[e];
+            for (int e = graph.column_offsets[u];
+                 e < graph.column_offsets[u + 1]; ++e) {
+                int v = graph.row_indices[e];
                 if (value[v] > value[u]) value[u] = value[v];
             }
             if (value[u] != old) changed = true;

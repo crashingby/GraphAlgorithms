@@ -13,10 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <vector>
 
+#include "include/distributed_benchmark.cuh"
 #include "include/distributed_partition.cuh"
 #include "include/spsc_queue.h"
 
@@ -99,6 +103,10 @@ __global__ void pagerankDistributedScoreAndMarkKernel(
  * 变化的绝对 delta 及其数量，供 CPU 在所有 rank 间计算全局平均 delta。
  * PageRank 不执行单调性检查。
  *
+ * 活跃 lane 与被分配冗余任务的 idle lane 先选择 owned 计算顶点，再共同
+ * 执行同一段 owned-plus-ghost 入邻居累加。只有目标选择、结果存放、比较
+ * 和主结果写回保留角色相关分支。
+ *
  * @warning `__syncthreads` 只同步当前 block，其他 block 仍可原地更新
  * values；主、副计算可能观察到不同阶段的值，因此 DMR 不一致不一定是
  * 硬件故障。NaN 也不会被当前大于 epsilon 的比较可靠捕获。
@@ -157,31 +165,35 @@ __global__ void pagerankDistributedToleranceKernel(
     __syncthreads();
 
     float old_value = valid ? values[tid] : 0.0f;
+    const bool does_redundant_work =
+        idle && idle_id >= 0 && idle_id < critical_count &&
+        idle_id < DG_BLOCK_SIZE;
+    int compute_vertex = -1;
+    if (is_active) {
+        compute_vertex = tid;
+    } else if (does_redundant_work) {
+        compute_vertex = critical_list[idle_id];
+    }
+
+    float computed_value = 0.0f;
+    if (compute_vertex >= 0) {
+        float sum = 0.0f;
+        for (int e = column_offsets[compute_vertex];
+             e < column_offsets[compute_vertex + 1]; ++e) {
+            int src = row_indices[e];
+            if (src >= 0 && src < local_node_count) {
+                int outdegree = local_outdegree[src];
+                if (outdegree > 0) sum += values[src] / (float)outdegree;
+            }
+        }
+        computed_value = (1.0f - PR_DIST_ALPHA) + PR_DIST_ALPHA * sum;
+    }
+
     float new_value = old_value;
     if (is_active) {
-        float sum = 0.0f;
-        for (int e = column_offsets[tid]; e < column_offsets[tid + 1]; ++e) {
-            int src = row_indices[e];
-            if (src >= 0 && src < local_node_count) {
-                int outdegree = local_outdegree[src];
-                if (outdegree > 0) sum += values[src] / (float)outdegree;
-            }
-        }
-        new_value = (1.0f - PR_DIST_ALPHA) + PR_DIST_ALPHA * sum;
-    }
-    __syncthreads();
-
-    if (idle && idle_id < critical_count && idle_id < DG_BLOCK_SIZE) {
-        int target = critical_list[idle_id];
-        float sum = 0.0f;
-        for (int e = column_offsets[target]; e < column_offsets[target + 1]; ++e) {
-            int src = row_indices[e];
-            if (src >= 0 && src < local_node_count) {
-                int outdegree = local_outdegree[src];
-                if (outdegree > 0) sum += values[src] / (float)outdegree;
-            }
-        }
-        redundant_results[idle_id] = (1.0f - PR_DIST_ALPHA) + PR_DIST_ALPHA * sum;
+        new_value = computed_value;
+    } else if (does_redundant_work) {
+        redundant_results[idle_id] = computed_value;
     }
     __syncthreads();
 
@@ -340,10 +352,6 @@ inline void pagerankMultiGPU(
         d_values, plans, world_size, rank, comm, compute_stream);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
     SpscQueue<int, PR_DIST_CHECK_BUFFER_COUNT> free_check_buffers;
     SpscQueue<PagerankDistributedCheckTask, PR_DIST_CHECK_BUFFER_COUNT>
         pending_check_tasks;
@@ -352,52 +360,55 @@ inline void pagerankMultiGPU(
     }
 
     std::atomic<bool> stop_check_worker(false);
+    std::mutex pending_mutex;
+    std::condition_variable pending_cv;
     std::vector<PagerankDistributedAsyncCheckResult> check_results(
         PR_DIST_MAX_ITERATIONS + 1);
 
-    // 该线程只读取已经由 check_done_event 发布的页锁定 host buffer。
-    // MPI 聚合留到所有迭代结束后在主线程执行，避免要求 MPI_THREAD_MULTIPLE。
+    // The worker sleeps between tasks and blocks on the oldest completed-copy
+    // event. It never calls MPI, preserving MPI_THREAD_FUNNELED semantics.
     std::thread check_worker([&]() {
         CUDA_CHECK(cudaSetDevice(device));
-        while (!stop_check_worker.load(std::memory_order_acquire) ||
-               !pending_check_tasks.empty()) {
-            bool progressed = false;
+        while (true) {
             PagerankDistributedCheckTask task;
-            if (pending_check_tasks.peek(task)) {
-                cudaError_t status =
-                    cudaEventQuery(check_done_events[task.buffer]);
-                if (status == cudaSuccess) {
-                    pending_check_tasks.try_pop(task);
-
-                    PagerankDistributedAsyncCheckResult result;
-                    result.done = true;
-                    result.dmr_error =
-                        h_check_info[task.buffer]->dmr_error_flag;
-                    result.sum_abs_delta =
-                        h_check_info[task.buffer]->sum_abs_delta;
-                    result.count_update =
-                        h_check_info[task.buffer]->count_update;
-                    if (task.iter >= 0 &&
-                        task.iter < static_cast<int>(check_results.size())) {
-                        check_results[task.iter] = result;
-                    }
-                    free_check_buffers.try_push(task.buffer);
-                    progressed = true;
-                } else if (status != cudaErrorNotReady) {
-                    CUDA_CHECK(status);
+            {
+                std::unique_lock<std::mutex> lock(pending_mutex);
+                pending_cv.wait(lock, [&]() {
+                    return stop_check_worker.load(std::memory_order_acquire) ||
+                           !pending_check_tasks.empty();
+                });
+                if (stop_check_worker.load(std::memory_order_acquire) &&
+                    pending_check_tasks.empty()) {
+                    break;
                 }
+                if (!pending_check_tasks.try_pop(task)) continue;
             }
-            if (!progressed) std::this_thread::yield();
+
+            CUDA_CHECK(cudaEventSynchronize(check_done_events[task.buffer]));
+            PagerankDistributedAsyncCheckResult result;
+            result.done = true;
+            result.dmr_error = h_check_info[task.buffer]->dmr_error_flag;
+            result.sum_abs_delta = h_check_info[task.buffer]->sum_abs_delta;
+            result.count_update = h_check_info[task.buffer]->count_update;
+            if (task.iter >= 0 &&
+                task.iter < static_cast<int>(check_results.size())) {
+                check_results[task.iter] = result;
+            }
+            free_check_buffers.try_push(task.buffer);
         }
     });
 
-    // Exclude queue and worker construction from the common GPU timing window.
-    CUDA_CHECK(cudaEventRecord(start, compute_stream));
+    DgIterationPhaseTimer phase_timer;
+    GraphCudaEventAccumulator graph_kernel_timer;
+    CUDA_CHECK(graph_cuda_timer_create(&graph_kernel_timer));
+    DgBenchmarkTiming timing;
     int iter = 0;
     int total_active = num_nodes;
+    const auto main_loop_start = std::chrono::steady_clock::now();
 
     while (iter < PR_DIST_MAX_ITERATIONS && total_active > 0) {
         ++iter;
+        phase_timer.start_pre(compute_stream);
         CUDA_CHECK(cudaMemsetAsync(
             d_active_count, 0, sizeof(int), compute_stream));
         pagerankDistributedScoreAndMarkKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, compute_stream>>>(
@@ -411,10 +422,12 @@ inline void pagerankMultiGPU(
         CUDA_CHECK(cudaMemsetAsync(
             iteration_check_info, 0,
             sizeof(PagerankDistributedCheckInfo), compute_stream));
+        CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, compute_stream));
         pagerankDistributedToleranceKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, compute_stream>>>(
             d_values, d_local_outdegree, d_row_offsets, d_column_indices, d_column_offsets, d_row_indices,
             d_active, d_update, part.owned_count, part.local_node_count,
             iteration_check_info);
+        CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, compute_stream));
 
         if (do_async_check) {
             CUDA_CHECK(cudaEventRecord(
@@ -429,20 +442,30 @@ inline void pagerankMultiGPU(
                 check_stream));
             CUDA_CHECK(cudaEventRecord(
                 check_done_events[check_buffer], check_stream));
-            while (!pending_check_tasks.try_push({iter, check_buffer})) {
-                std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex);
+                if (!pending_check_tasks.try_push({iter, check_buffer})) {
+                    fprintf(stderr, "PageRank async check queue invariant failed.\n");
+                    exit(EXIT_FAILURE);
+                }
             }
+            pending_cv.notify_one();
         }
 
         CUDA_CHECK(cudaMemsetAsync(
             d_active, 0xff, part.owned_count * sizeof(int), compute_stream));
         dgCopyOwnedUpdateKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, compute_stream>>>(
             d_update, d_active, part.owned_count);
+        phase_timer.stop_pre(compute_stream);
+
+        phase_timer.start_comm(compute_stream);
         dg_nccl_exchange_activation(
             d_update, d_active, plans, world_size, rank, comm, compute_stream);
         dg_nccl_exchange_float_values(
             d_values, plans, world_size, rank, comm, compute_stream);
+        phase_timer.stop_comm(compute_stream);
 
+        phase_timer.start_post(compute_stream);
         CUDA_CHECK(cudaMemsetAsync(
             d_update, 0xff, part.local_node_count * sizeof(int), compute_stream));
         CUDA_CHECK(cudaMemsetAsync(
@@ -454,21 +477,32 @@ inline void pagerankMultiGPU(
         CUDA_CHECK(cudaMemcpyAsync(
             &local_active, d_active_count, sizeof(int),
             cudaMemcpyDeviceToHost, compute_stream));
+        phase_timer.stop_post(compute_stream);
         CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        phase_timer.accumulate(timing.gpu_compute_ms, timing.nccl_exchange_ms);
+        CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
 
-        MPI_Allreduce(&local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        dg_timed_allreduce(
+            &local_active, &total_active, 1, MPI_INT, MPI_SUM,
+            MPI_COMM_WORLD, timing.mpi_sync_ms);
     }
 
-    CUDA_CHECK(cudaEventRecord(stop, compute_stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    float max_ms = 0.0f;
-    MPI_Reduce(&ms, &max_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+    timing.main_loop_ms = dg_elapsed_ms(
+        main_loop_start, std::chrono::steady_clock::now());
 
-    while (!pending_check_tasks.empty()) std::this_thread::yield();
-    stop_check_worker.store(true, std::memory_order_release);
+    // Drain measures only work still owned by the checker; result collectives
+    // belong to a separate post-check aggregation phase.
+    const auto drain_start = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        stop_check_worker.store(true, std::memory_order_release);
+    }
+    pending_cv.notify_one();
     if (check_worker.joinable()) check_worker.join();
+    timing.cpu_check_drain_ms = dg_elapsed_ms(
+        drain_start, std::chrono::steady_clock::now());
+
+    const auto postcheck_start = std::chrono::steady_clock::now();
 
     int global_dmr = 0;
     int global_residual_increase = 0;
@@ -480,8 +514,9 @@ inline void pagerankMultiGPU(
     for (int check_iter = 1; check_iter <= iter; ++check_iter) {
         int local_done = check_results[check_iter].done ? 1 : 0;
         int all_done = 0;
-        MPI_Allreduce(
-            &local_done, &all_done, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        dg_timed_allreduce(
+            &local_done, &all_done, 1, MPI_INT, MPI_MIN,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
         if (!all_done) continue;
         ++checked_iteration_count;
 
@@ -492,15 +527,15 @@ inline void pagerankMultiGPU(
         int local_dmr = check_results[check_iter].dmr_error ? 1 : 0;
         int iteration_global_dmr = 0;
 
-        MPI_Allreduce(
-            &local_sum_delta, &global_sum_delta,
-            1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(
-            &local_count_delta, &global_count_delta,
-            1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(
-            &local_dmr, &iteration_global_dmr,
-            1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+        dg_timed_allreduce(
+            &local_sum_delta, &global_sum_delta, 1, MPI_FLOAT, MPI_SUM,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
+        dg_timed_allreduce(
+            &local_count_delta, &global_count_delta, 1, MPI_INT, MPI_SUM,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
+        dg_timed_allreduce(
+            &local_dmr, &iteration_global_dmr, 1, MPI_INT, MPI_LOR,
+            MPI_COMM_WORLD, timing.postcheck_mpi_ms);
 
         if (iteration_global_dmr) {
             global_dmr = 1;
@@ -522,6 +557,11 @@ inline void pagerankMultiGPU(
         }
     }
 
+    timing.postcheck_total_ms = dg_elapsed_ms(
+        postcheck_start, std::chrono::steady_clock::now());
+    timing.graph_kernel_ms = graph_kernel_timer.total_ms;
+    dg_report_benchmark_timing(timing, rank, world_size);
+
     std::vector<float> h_owned(part.owned_count);
     CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(float), cudaMemcpyDeviceToHost));
     std::vector<int> counts = dg_owned_counts(world_size, num_nodes);
@@ -539,12 +579,12 @@ inline void pagerankMultiGPU(
         printf(", monotonic=N/A\n");
         printf("异步检测覆盖(PageRank): checked=%d/%d, skipped=%d\n",
                checked_iteration_count, iter, iter - checked_iteration_count);
-        printf("GPU time: %.4f ms\n", max_ms);
         printf("NCCL 分布式 PageRank 容错版本迭代 %d 次结束。\n", iter);
+        printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
     }
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    phase_timer.destroy();
+    CUDA_CHECK(graph_cuda_timer_destroy(&graph_kernel_timer));
     CUDA_CHECK(cudaStreamDestroy(check_stream));
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     dg_free_peer_plans(plans);

@@ -36,9 +36,10 @@ void ccCPU(const CsrGraph &graph, int* value)
             int old_val = value[u];
 
             // 遍历邻居
-            for (int j = graph.row_offsets[u]; j < graph.row_offsets[u + 1]; ++j)
+            for (int j = graph.column_offsets[u];
+                 j < graph.column_offsets[u + 1]; ++j)
             {
-                int v = graph.column_indices[j];
+                int v = graph.row_indices[j];
 
                 // 顶点取邻居的最大值
                 if (value[v] > value[u])

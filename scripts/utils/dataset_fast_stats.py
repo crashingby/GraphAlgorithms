@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DATASET_DIR = ROOT / "dataset"
 DEFAULT_OUTPUT = ROOT / "temp_downloads" / "dataset_stats_summary.md"
 
@@ -73,6 +73,8 @@ def fmt(value) -> str:
 def compute_stats(path: Path) -> dict[str, str]:
     n, one_based = read_header_and_base(path)
     degrees = [0] * n
+    outdegrees = [0] * n
+    indegrees = [0] * n
     edge_count = 0
 
     for u, v in iter_mtx_edges(path):
@@ -83,11 +85,22 @@ def compute_stats(path: Path) -> dict[str, str]:
             continue
         degrees[u] += 1
         degrees[v] += 1
+        outdegrees[u] += 1
+        indegrees[v] += 1
         edge_count += 1
 
     dmax = max(degrees) if degrees else 0
     davg = (2.0 * edge_count / n) if n > 0 else float("nan")
-    source = max(range(n), key=lambda v: (degrees[v], -v)) if n > 0 else -1
+    # Directed BFS follows outgoing edges; total-degree sinks are poor
+    # benchmark sources even when they look structurally central.
+    source = (
+        max(
+            range(n),
+            key=lambda v: (outdegrees[v], degrees[v], -v),
+        )
+        if n > 0
+        else -1
+    )
 
     sum_jk = 0.0
     sum_half_j_plus_k = 0.0
@@ -131,7 +144,18 @@ def compute_stats(path: Path) -> dict[str, str]:
         "Kmax": "skipped",
         "ωlb": "skipped",
         "source": fmt(source),
-        "source_degree": fmt(degrees[source] if source >= 0 else 0),
+        "source_degree": fmt(
+            outdegrees[source] if source >= 0 else 0
+        ),
+        "source_outdegree": fmt(
+            outdegrees[source] if source >= 0 else 0
+        ),
+        "source_indegree": fmt(
+            indegrees[source] if source >= 0 else 0
+        ),
+        "source_total_degree": fmt(
+            degrees[source] if source >= 0 else 0
+        ),
     }
 
 
@@ -156,6 +180,9 @@ def write_summary(rows: list[dict[str, str]], output: Path) -> None:
         "ωlb",
         "source",
         "source_degree",
+        "source_outdegree",
+        "source_indegree",
+        "source_total_degree",
     ]
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:

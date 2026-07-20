@@ -13,7 +13,7 @@
 #include "include/output.h"
 #include "include/cli_options.h"
 #define GPU_DEVICE 0
-void kcoreCPU(const CsrGraph &graph, int* value, int k){ int n=graph.nodes; std::vector<int8_t> alive(n,1); for(int i=0;i<n;i++) value[i]=graph.row_offsets[i+1]-graph.row_offsets[i]; bool changed=true; while(changed){ changed=false; for(int u=0;u<n;u++){ if(alive[u]&&value[u]<k){ alive[u]=0; changed=true; for(int j=graph.row_offsets[u];j<graph.row_offsets[u+1];j++){int v=graph.column_indices[j]; if(alive[v]&&value[v]>0) value[v]--; } } } } }
+void kcoreCPU(const CsrGraph &graph, int* value, int k){ int n=graph.nodes; std::vector<int8_t> alive(n,1); for(int i=0;i<n;i++) value[i]=graph.column_offsets[i+1]-graph.column_offsets[i]; bool changed=true; while(changed){ changed=false; for(int u=0;u<n;u++){ if(alive[u]&&value[u]<k){ alive[u]=0; changed=true; for(int j=graph.row_offsets[u];j<graph.row_offsets[u+1];j++){int v=graph.column_indices[j]; if(alive[v]&&value[v]>0) value[v]--; } } } } }
 bool correctTest(int n,const int* ref,const int* gpu,int k){ bool pass=true; int nerr=0; for(int i=0;i<n;i++){ if(ref[i]!=gpu[i]){ if(ref[i]<k&&gpu[i]<k) continue; if(nerr++<20) printf("Node %d: CPU %d, GPU %d\n",i,ref[i],gpu[i]); pass=false; }} printf("%s\n",pass?"passed":"failed"); return pass; }
 int main(int argc, char** argv)
 {

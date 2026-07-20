@@ -72,10 +72,12 @@ BuildMarketGraph: COO -> CSR（出边 CSR + 入边 CSR）
 这四个版本共享如下流程。
 
 1. `scoreAndMark*Kernel` 对当前活跃点计数并打分；`-1` 保持不活跃，普通点标成 `1`，关键点标成 `2`。
-2. 主 kernel 仍由所有活跃线程计算正常更新。
-3. 同一 CUDA block 内的 idle 线程（非活跃线程或越界线程）依次重算关键点；关键主结果和副结果不同则置 `dmr_error_flag`。
+2. 主 kernel 在每个 CUDA block 内收集关键点和 idle lane（非活跃或越界 lane），把可用 idle lane 依次分配给关键点。
+3. 活跃 lane 将 `compute_vertex` 设为自己的 `tid`，获得任务的 idle lane 将其设为对应关键点；两类 lane 随后执行同一段入邻居遍历。角色相关的 warp 分歧只保留在目标选择、结果存放、比较与主结果写回处，不再为主/副计算各执行一套邻接循环。
 4. kernel 同时写入少量 `MonotonicInfo`：DMR 标志、单调性标志、变化量的和、变化次数。
 5. compute stream 完成后，check stream 异步把该小结构复制到固定页锁定 host 缓冲区；后台 CPU 线程通过 SPSC 队列取任务、读取结果并判断平均变化量是否比上一轮增大。
+
+共同路径消除了 active/idle 角色分支各自遍历邻接表造成的串行化，也去掉了两段计算之间的一次 block barrier。不同顶点的入度仍会造成图结构固有的 lane 分歧；本次优化不改变这一点。queue 与多 GPU 容错 kernel 使用相同结构。
 
 关键点分数为：
 
@@ -83,7 +85,7 @@ BuildMarketGraph: COO -> CSR（出边 CSR + 入边 CSR）
 score = alpha * (outdegree / max_outdegree) + beta * value_score
 ```
 
-其中 CC、KCore 使用 `value_score = 1/(1+abs(value))`，PageRank 使用 `abs(value)`；BFS 使用活动数组中的距离型值 `1/(1+active[v])`。因此 `-a/-b/-t` 控制的是“哪些点值得重复计算”，**不改变算法本身的数学更新规则**。
+其中 BFS 使用真实距离 `1/(1+value[v])`，CC、KCore 使用 `1/(1+abs(value))`，PageRank 使用 `abs(value)`。BFS 不能使用 `active[v]`，因为它只是 `-1/1/2` 的工作集编码。因而 `-a/-b/-t` 只控制“哪些点值得重复计算”，**不改变算法本身的数学更新规则**。
 
 队列版本有 64 组 `MonotonicInfo` 缓冲；SPSC 队列分别管理空闲 buffer 与待检查任务。若没有空闲 buffer 或任务队列已满，当前轮仍会计算，但 CPU 检查会跳过，并使用 scratch buffer，因此覆盖并非逐轮保证。
 
@@ -104,7 +106,7 @@ score = alpha * (outdegree / max_outdegree) + beta * value_score
 
 ## 多 GPU 共用架构
 
-除 `bfs/multigpu` 的旧式专用实现外，多 GPU 版本共用 `include/distributed_partition.cuh`。
+BFS、CC、KCore、PageRank 的无容错和容错多 GPU 版本全部共用 `include/distributed_partition.cuh`。实际执行路径不再使用 BFS 历史上的 ceil 分区和专用 peer plan。
 
 ### 数据划分
 
@@ -126,7 +128,7 @@ owned 顶点 kernel
   → MPI_Allreduce(SUM) 得到全局活跃数
 ```
 
-最终所有 rank 通过 `MPI_Allgatherv` 拼回 owned 部分；时间以 CUDA event 测量。通信使用每个 peer 的固定索引计划：activation 计划来自跨分区出边，value 计划来自 ghost 所属顶点。当前实现每轮同步所需 ghost 值，不做“仅变化值”的压缩。
+最终所有 rank 通过 `MPI_Allgatherv` 拼回 owned 部分，该最终收集不进入内部算法时间。通信使用每个 peer 的固定索引计划：activation 计划来自跨分区出边，并按远端目标顶点去重——同一 sender 到同一远端顶点无论有多少条跨分区边，每轮只传一个激活标志；value 计划来自 ghost 所属顶点。当前实现每轮同步所需 ghost 值，不做“仅变化值”的压缩。
 
 `multigpu_basic` 只保留上述计算、通信和终止判断，分别同步：
 
@@ -144,7 +146,7 @@ BFS、CC、KCore、PageRank 的 `multigpu` 版本现在使用同一种异步检�
 2. compute stream 完成打分、容错 kernel 和检测摘要写入后记录 `compute_done` event。
 3. check stream 等待该 event，再把一个很小的 `CheckInfo` 异步复制到对应的页锁定 host buffer，并记录 `check_done` event。
 4. 主线程把 `{iteration, buffer}` 放入 pending SPSC 队列，然后继续执行 activation/value 通信及下一轮计算。
-5. 后台 worker 查询 `check_done`，保存该轮的 DMR、单调性、变化量之和与变化次数，再把 buffer 归还 free 队列。
+5. 后台 worker 在无任务时睡眠；收到任务后用 `cudaEventSynchronize(check_done)` 阻塞等待最老的 D2H 完成，保存该轮摘要并归还 buffer。它不再循环调用 `cudaEventQuery` 忙轮询，因此不会持续抢占 MPI 主线程所在 CPU。
 
 每个 rank 预分配 64 组 device/host 摘要 buffer、两组 event 和一组 device scratch。free 队列的消费者与 pending 队列的生产者都是 MPI 主线程，反方向均只有 worker，因此两条队列都保持严格 SPSC。四个入口通过 `MPI_Init_thread` 请求并检查 `MPI_THREAD_FUNNELED`；worker 明确不执行任何 MPI 调用，所以不需要 `MPI_THREAD_MULTIPLE`。
 
@@ -152,13 +154,50 @@ BFS、CC、KCore、PageRank 的 `multigpu` 版本现在使用同一种异步检�
 
 ### 结束后的跨 rank 汇总
 
-GPU 迭代结束后，主线程先排空任务并 join worker，再按迭代编号执行 MPI 汇总。只有所有 rank 都完成了某轮检查时，该轮才参与统计；随后分别汇总 delta 和更新次数，并对 DMR、单调性标志做逻辑或。平均变化量是在全局汇总后按轮比较的，PageRank 只报告 residual increase，不做单调性判断。
+GPU 迭代结束后，主线程发出停止请求并 join worker；这段单独计为 checker drain。随后主线程才按迭代编号执行 MPI 汇总：只有所有 rank 都完成了某轮检查时，该轮才参与统计，再分别汇总 delta、更新次数、DMR 和单调性标志。这一整段是 post-check aggregation，其中 MPI 调用时间还是一个可解释子集。PageRank 只报告 residual increase，不做单调性判断。
 
-这使 D2H 摘要复制和 CPU 判断不再成为每轮的同步点。每轮为了终止判断而进行的 compute stream 同步及 `MPI_Allreduce` 仍然存在，NCCL 通信逻辑也没有改变。四个版本统一在 worker 建立后开始计时、在 worker 排空前停止计时；rank 0 打印各 rank 中的最大值。因此 GPU time 表示最慢 rank 的 GPU 主流水线时间，不包含最终 CPU/MPI 检测汇总等待。
+D2H 摘要复制和 CPU 判断不会成为每轮同步点。每轮为了终止判断进行的 compute-stream 同步及 `MPI_Allreduce` 仍存在。四个算法的基础/容错版使用相同分区、peer plan、NCCL 顺序、终止判断和结果收集；容错版额外执行评分、选择性 DMR、摘要 D2H、CPU 消费与结束后汇总。
 
-### BFS 与其他算法仍有的结构差异
+### Benchmark 计时字段
 
-`bfs/multigpu/bfs_tolerance_multiGPU.cuh` 仍使用自己的 `GpuSubgraphHost/PeerPlan` 和按 `ceil(N/ranks)` 划分代码；CC、KCore、PageRank 使用 `include/distributed_partition.cuh`。BFS 检测版还只从源点及其出邻居构造初始 active 集，而 `bfs/multigpu_basic` 首轮将所有 owned 顶点设为 active。此次重构统一的是异步检测协议，没有改变这些既有算法和分区语义。
+所有主线入口都输出一条 `BENCHMARK_TIMING` 和一条 `BENCHMARK_ITERATIONS`。多 GPU 记录由 `include/distributed_benchmark.cuh` 统一生成，局部阶段定义如下：
+
+| 字段 | 精确范围 |
+|---|---|
+| `main_loop_ms` | `steady_clock` 测得的完整迭代循环：CUDA、NCCL、每轮主线程控制和终止 `MPI_Allreduce` |
+| `gpu_compute_ms` | CUDA stream 上 NCCL 区间之外的 CUDA 工作累计值；包括算法/评分/计数 kernel 和必要 copy，不等于纯 kernel |
+| `graph_kernel_ms` | 每轮用同 stream CUDA event 只包住核心图 kernel 后的累计值：basic 为普通 pull kernel，容错版为包含主计算与选择性冗余计算的 dual/tolerance kernel；不含评分、状态维护、通信或 CPU 检测 |
+| `nccl_exchange_ms` | 每轮 activation/value 的 pack、NCCL send/recv、unpack |
+| `mpi_sync_ms` | 主循环终止判断 `MPI_Allreduce` 的阻塞调用时间；含快 rank 等待慢 rank |
+| `cpu_check_drain_ms` | 主循环结束后，从发出 worker 停止请求到 join 返回；只包含尚未隐藏的检测工作 |
+| `postcheck_total_ms` | worker join 后按迭代汇总检测结果的完整阶段 |
+| `postcheck_mpi_ms` | post-check 内 MPI 调用时间，是 `postcheck_total_ms` 的子集，不能再次相加 |
+
+兼容字段 `gpu_main_ms == main_loop_ms`，`cpu_check_tail_ms == cpu_check_drain_ms`。schema v4 绘图要求新的 kernel 字段，v3 及更早 CSV 不能与新结果混画。每个 rank 的不重叠内部总耗时是：
+
+```text
+algorithm_total = main_loop + cpu_check_drain + postcheck_total
+```
+
+基础多 GPU 版的 drain 和 post-check 都为 0。容错版的结果汇总不再伪装成 CPU drain，这正是旧图里“两 GPU drain 明显变大”的主要统计问题。
+
+`communication_ms` 是解释性调用时间：
+
+```text
+communication = nccl_exchange + mpi_sync + postcheck_mpi
+```
+
+它已经分别处于 main loop 或 post-check total 内，绝不能再叠加到 `algorithm_total`。同理，`postcheck_mpi_ms` 也不能加到 `postcheck_total_ms` 上。
+
+每个局部字段同时输出 rank max 和真实 rank 算术平均 `rank_*_avg_ms`。核心 kernel 因而对应 rank-max `graph_kernel_ms` 和真实均值 `rank_graph_kernel_avg_ms`；后者用于两 GPU kernel 对比图。rank max 的各组件可能来自不同 rank，所以 max communication 不保证等于几个 max 组件之和；作图分解必须使用 rank-mean 字段。内部总耗时先在每个 rank 内相加，再分别计算 `rank_algorithm_total_avg_ms` 与 `rank_algorithm_total_max_ms`，不能把三个独立最大值直接相加。
+
+单 GPU 二进制保留原 CUDA-event 主区间，并新增单独的核心 `graph_kernel_ms`。实验 runner 在 schema v4 中把主区间映射到 `main_loop_ms/gpu_compute_ms`，把原 `cpu_check_tail_ms` 映射为 drain，post-check 置 0。核心 kernel 数值使用 `include/cuda_event_timer.cuh` 中的 CUDA event 累加器；NVTX 只用于 profiler 展示，不作为 CSV 数值来源。严格开销百分比始终只在相同 GPU 模式、相同迭代数的 basic/容错 pair 内计算。四柱绝对时间可用于总体观察，但单 GPU 与多 GPU 内部字段的边界仍不完全相同；完整端到端范围应看 Python 的 `wall_time_ms`。
+
+`graph_kernel_ms` 是 `gpu_compute_ms` 的子集，不能与其相加。多 GPU 初始化 ghost 交换、最终结果 D2H、`MPI_Allgatherv` 和计时报告自身的归约均排除在内部总耗时之外。
+
+### BFS 已与其他算法统一的部分
+
+BFS 两个多 GPU 版本现在都使用共享的平衡连续分区、owned + ghost 布局、去重 activation plan 和 value plan。pull BFS 的首轮工作集也统一为 `source + source 的出邻居`：source 自身保留用于一致性，出邻居才能在第一轮通过入边观察到 source。两版每轮的 activation/value 通信与全局终止判断顺序一致；剩余差异就是容错版的评分、DMR 和异步检测语义。
 
 ## 参数与使用建议
 
@@ -182,6 +221,6 @@ GPU 迭代结束后，主线程先排空任务并 join worker，再按迭代编�
 3. 多 GPU 通信模型依赖完整图被每个 rank 读入和 host 侧全量分区，超大图的 host 内存与分区构建成本很高。
 4. CC/KCore 的通常无向语义要求输入中已有反向边；项目读图不会自动补边。
 5. PageRank 的公式、更新方式和 dangling-node 处理不同于标准归一化 PageRank，跨实现或论文基线比较前应先统一定义。
-6. BFS 多 GPU 检测版仍有独立的分区与初始 active 语义；比较 BFS 两个多 GPU 版本时，不能把耗时或迭代数差异全部归因于检测开销。
+6. BFS 已与其他算法共享分区、通信和初始工作集；若同一两 GPU pair 的迭代数仍不同，应先按 bug 或非确定性调查，实验脚本不会把该 repeat 用于开销百分比。
 7. 原地更新会使选择性 DMR 出现无故障不一致；若以后需要把告警解释为可靠故障判据，应改成快照或双缓冲计算，并重新定义检测时序。
-8. CC/KCore/PageRank 的公共分区路径目前假定 `MPI rank 数 <= 顶点数`；否则可能形成空 owned 分区并触发零 block launch。BFS 专用路径对空分区做了额外保护。
+8. 公共多 GPU 路径目前假定 `MPI rank 数 <= 顶点数`；否则可能形成空 owned 分区并触发零 block launch。当前实验固定两 rank，数据集规模远大于 2。

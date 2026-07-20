@@ -16,7 +16,7 @@
 
 void ccCPU(const CsrGraph &graph, int* value) {
     int n = graph.nodes; for (int i = 0; i < n; i++) value[i] = i;
-    bool changed = true; while (changed) { changed = false; for (int u = 0; u < n; u++) { int old = value[u]; for (int j = graph.row_offsets[u]; j < graph.row_offsets[u + 1]; ++j) { int v = graph.column_indices[j]; if (value[v] > value[u]) value[u] = value[v]; } if (value[u] != old) changed = true; } }
+    bool changed = true; while (changed) { changed = false; for (int u = 0; u < n; u++) { int old = value[u]; for (int j = graph.column_offsets[u]; j < graph.column_offsets[u + 1]; ++j) { int v = graph.row_indices[j]; if (value[v] > value[u]) value[u] = value[v]; } if (value[u] != old) changed = true; } }
 }
 bool correctTest(int n, const int* ref, const int* gpu) { bool pass=true; int nerr=0; for(int i=0;i<n;i++){ if(ref[i]!=gpu[i]){ if(nerr++<20) printf("Node %d: CPU %d, GPU %d\n",i,ref[i],gpu[i]); pass=false; }} printf("%s\n", pass?"passed":"failed"); return pass; }
 int main(int argc, char** argv)

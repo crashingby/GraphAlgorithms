@@ -6,6 +6,7 @@
  * activates outgoing neighbors when its label increases.
  */
 #include <cuda_runtime.h>
+#include "include/cuda_event_timer.cuh"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -116,6 +117,8 @@ void ccGPU(
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+    GraphCudaEventAccumulator graph_kernel_timer;
+    graph_cuda_timer_create(&graph_kernel_timer);
 
     cudaEventRecord(start);
     // ------------------- BFS 迭代 -------------------
@@ -128,12 +131,15 @@ void ccGPU(
         iter++;
 
         // 执行拉模式核函数
+        graph_cuda_timer_start(&graph_kernel_timer);
         ccPullKernel<<<num_blocks, BLOCK_SIZE>>>(
             d_values, d_row_offsets, d_column_indices,
             d_column_offsets, d_row_indices,
             d_active, d_update, num_nodes
         );
+        graph_cuda_timer_stop(&graph_kernel_timer);
         cudaDeviceSynchronize();
+        graph_cuda_timer_accumulate(&graph_kernel_timer);
 
         // 更新下一轮活跃数组
         cudaMemcpy(d_active, d_update, num_nodes*sizeof(int), cudaMemcpyDeviceToDevice);
@@ -158,6 +164,12 @@ void ccGPU(
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
     printf("GPU time: %.4f ms\n", ms);
+    printf("BENCHMARK_TIMING gpu_main_ms=%.4f graph_kernel_ms=%.4f "
+           "cpu_check_tail_ms=0.0000 "
+           "nccl_exchange_ms=0.0000 mpi_sync_ms=0.0000 communication_ms=0.0000\n",
+           ms, graph_kernel_timer.total_ms);
+    printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
+    graph_cuda_timer_destroy(&graph_kernel_timer);
     
     // ------------------- 释放内存 -------------------
     cudaFree(d_values); cudaFree(d_row_offsets); cudaFree(d_column_indices);

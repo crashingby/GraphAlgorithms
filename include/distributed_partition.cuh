@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define DG_BLOCK_SIZE 256
@@ -238,6 +239,10 @@ inline void dg_build_peer_plans(
 
     for (int r = 0; r < world_size; ++r) {
         const DgSubgraphHost& p = parts[r];
+        // Activation is a vertex flag, not an edge payload. A remote owned
+        // vertex therefore needs at most one entry from this sender even when
+        // several cross-partition edges target it.
+        std::vector<std::unordered_set<int>> seen_remote_targets(world_size);
         for (int lv = 0; lv < p.owned_count; ++lv) {
             for (int e = p.row_offsets[lv]; e < p.row_offsets[lv + 1]; ++e) {
                 int dst_local = p.column_indices[e];
@@ -245,6 +250,7 @@ inline void dg_build_peer_plans(
                 if (dst_global < 0 || dst_global >= num_nodes) continue;
                 int peer = dg_owner_of_vertex(dst_global, world_size, num_nodes);
                 if (peer < 0 || peer >= world_size || peer == r) continue;
+                if (!seen_remote_targets[peer].insert(dst_global).second) continue;
                 plans[r][peer].act_send_local.push_back(dst_local);
                 plans[peer][r].act_recv_owned.push_back(dst_global - parts[peer].start_node);
             }

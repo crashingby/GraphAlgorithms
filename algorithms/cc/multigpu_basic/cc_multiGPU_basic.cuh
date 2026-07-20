@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <vector>
 
+#include "include/distributed_benchmark.cuh"
 #include "include/distributed_partition.cuh"
 
 /**
@@ -148,17 +149,18 @@ inline void ccMultiGPUBasic(
     dg_nccl_exchange_int_values(d_values, plans, world_size, rank, comm, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start, stream));
-
+    DgIterationPhaseTimer phase_timer;
+    GraphCudaEventAccumulator graph_kernel_timer;
+    CUDA_CHECK(graph_cuda_timer_create(&graph_kernel_timer));
+    DgBenchmarkTiming timing;
     int iter = 0;
     int total_active = num_nodes;
+    const auto main_loop_start = std::chrono::steady_clock::now();
 
     while (iter < 1000 && total_active > 0) {
         ++iter;
+        phase_timer.start_pre(stream);
+        CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, stream));
         ccDistributedPullKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
             d_values,
             d_row_offsets,
@@ -170,6 +172,7 @@ inline void ccMultiGPUBasic(
             part.owned_count,
             part.local_node_count
         );
+        CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, stream));
 
         CUDA_CHECK(cudaMemsetAsync(d_active, 0xff, part.owned_count * sizeof(int), stream));
         dgCopyOwnedUpdateKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
@@ -177,9 +180,13 @@ inline void ccMultiGPUBasic(
             d_active,
             part.owned_count
         );
+        phase_timer.stop_pre(stream);
+        phase_timer.start_comm(stream);
         dg_nccl_exchange_activation(d_update, d_active, plans, world_size, rank, comm, stream);
         dg_nccl_exchange_int_values(d_values, plans, world_size, rank, comm, stream);
+        phase_timer.stop_comm(stream);
 
+        phase_timer.start_post(stream);
         CUDA_CHECK(cudaMemsetAsync(d_update, 0xff, part.local_node_count * sizeof(int), stream));
         CUDA_CHECK(cudaMemsetAsync(d_active_count, 0, sizeof(int), stream));
         dgCountActiveKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
@@ -189,15 +196,24 @@ inline void ccMultiGPUBasic(
         );
 
         int local_active = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&local_active, d_active_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            &local_active, d_active_count, sizeof(int),
+            cudaMemcpyDeviceToHost, stream));
+        phase_timer.stop_post(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        MPI_Allreduce(&local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        phase_timer.accumulate(timing.gpu_compute_ms, timing.nccl_exchange_ms);
+        CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
+
+        const double mpi_sync_start = MPI_Wtime();
+        MPI_Allreduce(
+            &local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        timing.mpi_sync_ms += (MPI_Wtime() - mpi_sync_start) * 1000.0;
     }
 
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    timing.main_loop_ms = dg_elapsed_ms(
+        main_loop_start, std::chrono::steady_clock::now());
+    timing.graph_kernel_ms = graph_kernel_timer.total_ms;
+    dg_report_benchmark_timing(timing, rank, world_size);
 
     std::vector<int> h_owned(part.owned_count);
     CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(int), cudaMemcpyDeviceToHost));
@@ -208,12 +224,12 @@ inline void ccMultiGPUBasic(
                    h_value, counts.data(), displs.data(), MPI_INT, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("GPU time: %.4f ms\n", ms);
         printf("CC 多节点无容错版本迭代 %d 次结束。\n", iter);
+        printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
     }
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    phase_timer.destroy();
+    CUDA_CHECK(graph_cuda_timer_destroy(&graph_kernel_timer));
     CUDA_CHECK(cudaStreamDestroy(stream));
     dg_free_peer_plans(plans);
     cudaFree(d_values);
