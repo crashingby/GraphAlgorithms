@@ -45,9 +45,12 @@ __global__ void kcorePullKernel(
     }
      d_values[tid] = newVal;
 
-    // 如果度低于 k 且之前是 alive，则置为 dead，并通知邻居 
-    // 保证活跃顶点的度数一定大于等于k
-    if (newVal < k) {
+    // A vertex transitions from live to dead exactly once. It can be present
+    // in a later work set because another concurrently peeled neighbor marked
+    // it before this thread observed its own death. Re-propagating from such
+    // an already-dead vertex adds redundant work and disagrees with the queue
+    // and distributed KCore implementations.
+    if (d_alive[tid] != 0 && newVal < k) {
         d_alive[tid] = 0;
         for (int i = d_row_offsets[tid]; i < d_row_offsets[tid + 1]; i++) {
             int dst = d_column_indices[i];
