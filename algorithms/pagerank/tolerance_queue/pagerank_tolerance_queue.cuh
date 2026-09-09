@@ -3,7 +3,7 @@
  * @brief Single-GPU PageRank with selective DMR and asynchronous CPU checks.
  */
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <atomic>
@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include "include/spsc_queue.h"
+#include <utility>
 #include "include/cuda_event_timer.cuh"
 
 #define BLOCK_SIZE 256
@@ -111,15 +112,21 @@ struct AsyncCheckResult {
 };
 
 /**
- * @brief Update ranks and selectively duplicate critical pull calculations.
+ * @brief Update ranks from one immutable snapshot and selectively duplicate
+ *        critical pull calculations.
  * @note DMR mismatches are reported only; the primary result is retained.
  * @details Active and assigned redundant lanes select a compute vertex before
  * entering one common incoming-neighbor accumulation. Role divergence is
  * limited to target selection and result placement; only the primary lane
- * performs authoritative writeback.
+ * performs authoritative writeback. Both roles read @p d_current_values,
+ * which remains immutable for the full kernel launch, and primaries write
+ * only @p d_next_values. Thus a DMR comparison evaluates the same function
+ * on the same iteration snapshot rather than two moments of an in-place
+ * update.
  */
 __global__ void pagerankPullDualKernel(
-    float* d_values,
+    const float* d_current_values,
+    float* d_next_values,
     const int* d_row_offsets,
     const int* d_column_indices,
     const int* d_column_offsets,
@@ -148,7 +155,7 @@ __global__ void pagerankPullDualKernel(
     if (idle) iid = atomicAdd(&idle_count, 1);
     __syncthreads();
 
-    float oldVal = valid ? d_values[tid] : 0.0f;
+    float oldVal = valid ? d_current_values[tid] : 0.0f;
     const bool does_redundant_work =
         idle && iid >= 0 && iid < critical_count && iid < BLOCK_SIZE;
     int compute_vertex = -1;
@@ -162,7 +169,7 @@ __global__ void pagerankPullDualKernel(
              i < d_column_offsets[compute_vertex + 1]; ++i) {
             int neighbor = d_row_indices[i];
             int outDegree = d_row_offsets[neighbor + 1] - d_row_offsets[neighbor];
-            if (outDegree > 0) sum += d_values[neighbor] / (float)outDegree;
+            if (outDegree > 0) sum += d_current_values[neighbor] / (float)outDegree;
         }
         computed_value = (1.0f - PR_ALPHA) + PR_ALPHA * sum;
     }
@@ -174,13 +181,17 @@ __global__ void pagerankPullDualKernel(
         redundant_results[iid] = computed_value;
     }
     __syncthreads();
-    if (critical && cid >= 0 && cid < idle_count && cid < BLOCK_SIZE && fabsf(redundant_results[cid] - mainVal) > 1e-5f) {
-        atomicExch(&(d_info->dmr_error_flag), 1);
+    if (critical && cid >= 0 && cid < idle_count && cid < BLOCK_SIZE) {
+        const float redundant_value = redundant_results[cid];
+        if (!isfinite(mainVal) || !isfinite(redundant_value) ||
+            __float_as_uint(redundant_value) != __float_as_uint(mainVal)) {
+            atomicExch(&(d_info->dmr_error_flag), 1);
+        }
     }
     __syncthreads();
 
     if (active) {
-        d_values[tid] = mainVal;
+        d_next_values[tid] = mainVal;
         float delta = fabsf(mainVal - oldVal);
         if (delta > 0.0f) {
             atomicAdd(&(d_info->sum_abs_delta), delta);
@@ -222,11 +233,12 @@ void pagerankGPU(
     for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) CUDA_CHECK(cudaMallocHost(&h_info[i], sizeof(MonotonicInfo)));
     for (int i = 0; i < num_nodes; ++i) { h_active[i] = 1; h_value[i] = 1.0f / (float)num_nodes; }
 
-    float* d_values;
+    float *d_current_values, *d_next_values;
     int *d_ro, *d_ci, *d_co, *d_ri, *d_active, *d_update, *d_num_active;
     MonotonicInfo* d_info[CHECK_BUFFER_COUNT];
     MonotonicInfo* d_info_scratch;
-    CUDA_CHECK(cudaMalloc(&d_values, num_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_current_values, num_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_next_values, num_nodes * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_ro, (num_nodes + 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_ci, num_edges * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_co, (num_nodes + 1) * sizeof(int)));
@@ -237,7 +249,7 @@ void pagerankGPU(
     for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) CUDA_CHECK(cudaMalloc(&d_info[i], sizeof(MonotonicInfo)));
     CUDA_CHECK(cudaMalloc(&d_info_scratch, sizeof(MonotonicInfo)));
 
-    CUDA_CHECK(cudaMemcpy(d_values, h_value, num_nodes * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_current_values, h_value, num_nodes * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_ro, h_row_offsets, (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_ci, h_column_indices, num_edges * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_co, h_column_offsets, (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -305,7 +317,7 @@ void pagerankGPU(
     int active_nodes = num_nodes;
     CUDA_CHECK(cudaMemsetAsync(d_num_active, 0, sizeof(int), compute_stream));
     scoreAndMarkFloatKernel<<<blocks, BLOCK_SIZE, 0, compute_stream>>>(
-        d_active, d_values, d_ro, num_nodes, max_outdegree, alpha, beta, threshold, d_num_active
+        d_active, d_current_values, d_ro, num_nodes, max_outdegree, alpha, beta, threshold, d_num_active
     );
 
     while (iter < 1000) {
@@ -313,12 +325,17 @@ void pagerankGPU(
         {
             NvtxRange enqueue_range(nvtx_name("main enqueue pagerank/check", iter));
             int check_buf = -1;
+            // The next buffer starts as an exact copy so inactive values persist.
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_next_values, d_current_values, num_nodes * sizeof(float),
+                cudaMemcpyDeviceToDevice, compute_stream));
             bool do_async_check = free_buffers.try_pop(check_buf);
             MonotonicInfo* iter_info = do_async_check ? d_info[check_buf] : d_info_scratch;
             CUDA_CHECK(cudaMemsetAsync(iter_info, 0, sizeof(MonotonicInfo), compute_stream));
             CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, compute_stream));
             pagerankPullDualKernel<<<blocks, BLOCK_SIZE, 0, compute_stream>>>(
-                d_values, d_ro, d_ci, d_co, d_ri, d_active, d_update, num_nodes, iter_info
+                d_current_values, d_next_values, d_ro, d_ci, d_co, d_ri,
+                d_active, d_update, num_nodes, iter_info
             );
             CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, compute_stream));
             if (do_async_check) {
@@ -339,10 +356,11 @@ void pagerankGPU(
         { NvtxRange sync_range(nvtx_name("main compute sync", iter)); CUDA_CHECK(cudaStreamSynchronize(compute_stream));
             CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer)); }
         {
+        std::swap(d_current_values, d_next_values);
             NvtxRange score_range(nvtx_name("main score active", iter));
             CUDA_CHECK(cudaMemsetAsync(d_num_active, 0, sizeof(int), compute_stream));
             scoreAndMarkFloatKernel<<<blocks, BLOCK_SIZE, 0, compute_stream>>>(
-                d_active, d_values, d_ro, num_nodes, max_outdegree, alpha, beta, threshold, d_num_active
+                d_active, d_current_values, d_ro, num_nodes, max_outdegree, alpha, beta, threshold, d_num_active
             );
         }
         {
@@ -353,7 +371,7 @@ void pagerankGPU(
         if (active_nodes == 0) break;
     }
 
-    CUDA_CHECK(cudaMemcpy(h_value, d_values, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_value, d_current_values, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     float ms = 0.0f;
@@ -374,7 +392,7 @@ void pagerankGPU(
            ms, graph_kernel_timer.total_ms, cpu_check_tail_ms);
     printf("BENCHMARK_ITERATIONS iterations=%d\n", iter);
 
-    CUDA_CHECK(cudaFree(d_values)); CUDA_CHECK(cudaFree(d_ro)); CUDA_CHECK(cudaFree(d_ci));
+    CUDA_CHECK(cudaFree(d_current_values)); CUDA_CHECK(cudaFree(d_next_values)); CUDA_CHECK(cudaFree(d_ro)); CUDA_CHECK(cudaFree(d_ci));
     CUDA_CHECK(cudaFree(d_co)); CUDA_CHECK(cudaFree(d_ri)); CUDA_CHECK(cudaFree(d_active));
     CUDA_CHECK(cudaFree(d_update)); CUDA_CHECK(cudaFree(d_num_active));
     for (int i = 0; i < CHECK_BUFFER_COUNT; ++i) {

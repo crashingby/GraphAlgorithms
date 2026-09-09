@@ -132,7 +132,8 @@ inline void kcoreMultiGPUBasic(
 
     std::vector<int> h_local_value(part.local_node_count, 0);
     for (int lv = 0; lv < part.owned_count; ++lv) {
-        h_local_value[lv] = part.row_offsets[lv + 1] - part.row_offsets[lv];
+        /** @brief Owned CSC offsets encode the support recounted by the pull kernel. */
+        h_local_value[lv] = part.column_offsets[lv + 1] - part.column_offsets[lv];
     }
     std::vector<int> h_alive(part.local_node_count, 1);
     std::vector<int> h_active(part.owned_count, 1);

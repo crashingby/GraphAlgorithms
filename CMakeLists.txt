@@ -14,16 +14,35 @@ set(GRAPH_OUTPUT_ROOT "${CMAKE_SOURCE_DIR}/outputs" CACHE PATH "Runtime result o
 # -----------------------------
 # NCCL manual path
 # -----------------------------
-set(NCCL_ROOT "/home/huangxy/software/nccl" CACHE PATH "NCCL installation root")
-set(NCCL_INCLUDE_DIR "${NCCL_ROOT}/include")
-set(NCCL_LIBRARY "${NCCL_ROOT}/lib/libnccl.so")
+set(NCCL_ROOT "/home/huangxy/software/nccl"
+    CACHE PATH "NCCL installation root")
 
-if (NOT EXISTS "${NCCL_INCLUDE_DIR}/nccl.h")
-    message(FATAL_ERROR "NCCL header not found: ${NCCL_INCLUDE_DIR}/nccl.h")
+find_path(
+    NCCL_INCLUDE_DIR
+    NAMES nccl.h
+    PATHS
+        "${NCCL_ROOT}/include"
+    NO_DEFAULT_PATH
+)
+
+find_library(
+    NCCL_LIBRARY
+    NAMES nccl
+    PATHS
+        "${NCCL_ROOT}/lib"
+        "${NCCL_ROOT}/lib64"
+        "${NCCL_ROOT}/lib/x86_64-linux-gnu"
+    NO_DEFAULT_PATH
+)
+
+if (NOT NCCL_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "NCCL header not found under NCCL_ROOT=${NCCL_ROOT}")
 endif()
 
-if (NOT EXISTS "${NCCL_LIBRARY}")
-    message(FATAL_ERROR "NCCL library not found: ${NCCL_LIBRARY}")
+if (NOT NCCL_LIBRARY)
+    message(FATAL_ERROR
+        "NCCL library not found under NCCL_ROOT=${NCCL_ROOT}")
 endif()
 
 message(STATUS "NCCL include: ${NCCL_INCLUDE_DIR}")

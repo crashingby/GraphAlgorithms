@@ -3,7 +3,7 @@
  * @brief Single-GPU CC with selective DMR and asynchronous CPU checks.
  */
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <atomic>

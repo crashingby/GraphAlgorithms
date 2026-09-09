@@ -14,7 +14,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include "include/spsc_queue.h"
 #include "include/cuda_event_timer.cuh"
 

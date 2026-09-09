@@ -3,7 +3,7 @@
  * @brief Single-GPU k-core with selective DMR and asynchronous CPU checks.
  */
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <atomic>
@@ -231,7 +231,8 @@ void kcoreGPU(
     for (int i = 0; i < num_nodes; ++i) {
         h_active[i] = 1;
         h_alive[i] = 1;
-        h_value[i] = h_row_offsets[i + 1] - h_row_offsets[i];
+        /** @brief Match the pull kernel's directed incoming-live-neighbor recount. */
+        h_value[i] = h_column_offsets[i + 1] - h_column_offsets[i];
     }
 
     int *d_values, *d_alive, *d_ro, *d_ci, *d_co, *d_ri, *d_active, *d_update, *d_num_active;

@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include <utility>
 #include "include/distributed_benchmark.cuh"
 #include "include/distributed_partition.cuh"
 #include "include/spsc_queue.h"
@@ -96,22 +97,22 @@ __global__ void pagerankDistributedScoreAndMarkKernel(
 }
 
 /**
- * @brief 更新 owned 顶点的 PageRank，并为关键顶点执行块内选择性 DMR。
+ * @brief 从冻结的迭代快照更新 owned PageRank，并为关键顶点执行块内选择性 DMR。
  *
  * 每个活跃线程完成一次 pull 更新；同一 block 中的空闲线程为关键顶点
- * 重算结果，差值超过 1e-6 时设置 DMR 标志。该 kernel 还累计本轮发生
+ * 重算结果与主结果按位不一致，或任一结果非有限时设置 DMR 标志。该 kernel 还累计本轮发生
  * 变化的绝对 delta 及其数量，供 CPU 在所有 rank 间计算全局平均 delta。
  * PageRank 不执行单调性检查。
  *
  * 活跃 lane 与被分配冗余任务的 idle lane 先选择 owned 计算顶点，再共同
  * 执行同一段 owned-plus-ghost 入邻居累加。只有目标选择、结果存放、比较
- * 和主结果写回保留角色相关分支。
+ * 和主结果写回保留角色相关分支。所有累加仅读取 @p current_values，
+ * 因而主、副计算使用同一全局快照；主结果只写入 @p next_values。
+ * 这消除了跨 block 原地读写造成的 DMR 逻辑性假阳性。
  *
- * @warning `__syncthreads` 只同步当前 block，其他 block 仍可原地更新
- * values；主、副计算可能观察到不同阶段的值，因此 DMR 不一致不一定是
- * 硬件故障。NaN 也不会被当前大于 epsilon 的比较可靠捕获。
  *
- * @param values owned 顶点在前、ghost 顶点在后的本地值数组。
+ * @param current_values owned 顶点在前、ghost 顶点在后的当前迭代值。
+ * @param next_values 写入本轮 owned 结果并随后刷新 ghost 的下一迭代值。
  * @param local_outdegree 本地 owned/ghost 顶点对应的全局出度。
  * @param row_offsets owned 顶点的出边 CSR 偏移。
  * @param column_indices 出邻居的本地编号。
@@ -124,7 +125,8 @@ __global__ void pagerankDistributedScoreAndMarkKernel(
  * @param check_info 本轮固定大小的 GPU 检查摘要。
  */
 __global__ void pagerankDistributedToleranceKernel(
-    float* values,
+    const float* current_values,
+    float* next_values,
     const int* local_outdegree,
     const int* row_offsets,
     const int* column_indices,
@@ -164,7 +166,7 @@ __global__ void pagerankDistributedToleranceKernel(
     if (idle) idle_id = atomicAdd(&idle_count, 1);
     __syncthreads();
 
-    float old_value = valid ? values[tid] : 0.0f;
+    float old_value = valid ? current_values[tid] : 0.0f;
     const bool does_redundant_work =
         idle && idle_id >= 0 && idle_id < critical_count &&
         idle_id < DG_BLOCK_SIZE;
@@ -183,7 +185,7 @@ __global__ void pagerankDistributedToleranceKernel(
             int src = row_indices[e];
             if (src >= 0 && src < local_node_count) {
                 int outdegree = local_outdegree[src];
-                if (outdegree > 0) sum += values[src] / (float)outdegree;
+                if (outdegree > 0) sum += current_values[src] / (float)outdegree;
             }
         }
         computed_value = (1.0f - PR_DIST_ALPHA) + PR_DIST_ALPHA * sum;
@@ -198,15 +200,19 @@ __global__ void pagerankDistributedToleranceKernel(
     __syncthreads();
 
     if (critical && critical_id >= 0 && critical_id < idle_count &&
-        critical_id < DG_BLOCK_SIZE && fabsf(redundant_results[critical_id] - new_value) > 1e-6f) {
-        atomicExch(&check_info->dmr_error_flag, 1);
+        critical_id < DG_BLOCK_SIZE) {
+        const float redundant_value = redundant_results[critical_id];
+        if (!isfinite(new_value) || !isfinite(redundant_value) ||
+            __float_as_uint(redundant_value) != __float_as_uint(new_value)) {
+            atomicExch(&check_info->dmr_error_flag, 1);
+        }
     }
     __syncthreads();
 
     if (!valid) return;
     if (!is_active) return;
 
-    values[tid] = new_value;
+    next_values[tid] = new_value;
     float diff = fabsf(new_value - old_value);
     if (diff != 0.0f) {
         atomicAdd(&check_info->sum_abs_delta, diff);
@@ -223,13 +229,15 @@ __global__ void pagerankDistributedToleranceKernel(
 /**
  * @brief 运行基于 MPI rank 分区和 NCCL ghost 同步的容错 PageRank。
  *
- * 算法更新、激活传播和 ghost value 同步均位于 compute stream。每轮
+ * 算法更新、激活传播和 ghost value 同步均位于 compute stream。每轮先将
+ * current value buffer 复制到 next buffer，使 pull 与 DMR 重算只读同一
+ * 冻结快照；NCCL 刷新 next buffer 的 ghost 值后才交换两者。
  * 容错 kernel 完成后，函数从固定 buffer 池取一个检查缓冲，通过 event
  * 令独立 check stream 异步执行 D2H；后台 CPU 线程轮询完成事件，并把
  * DMR 与 delta 摘要按迭代保存。迭代结束后，各 rank 使用 MPI 汇总完整
  * 的检查结果，报告全局 DMR 和平均 delta 增大；检测只报告、不恢复。
  * 若 buffer 池暂时耗尽，该轮仍使用 scratch 完成算法，但不向最终检测
- * 报告贡献 DMR 或 residual 证据。当前差值比较也不单独捕获 NaN。
+ * 报告贡献 DMR 或 residual 证据。
  *
  * @param h_value 输出全图 PageRank 值；每个 rank 最终均通过 Allgatherv 获得完整结果。
  * @param h_row_offsets 全图出边 CSR 行偏移。
@@ -295,7 +303,8 @@ inline void pagerankMultiGPU(
         if (outdegree > max_outdegree) max_outdegree = outdegree;
     }
 
-    float* d_values = nullptr;
+    float* d_current_values = nullptr;
+    float* d_next_values = nullptr;
     int *d_local_outdegree = nullptr, *d_row_offsets = nullptr, *d_column_indices = nullptr;
     int *d_column_offsets = nullptr, *d_row_indices = nullptr, *d_active = nullptr;
     int *d_update = nullptr, *d_active_count = nullptr;
@@ -307,7 +316,8 @@ inline void pagerankMultiGPU(
     std::vector<cudaEvent_t> compute_done_events(PR_DIST_CHECK_BUFFER_COUNT);
     std::vector<cudaEvent_t> check_done_events(PR_DIST_CHECK_BUFFER_COUNT);
 
-    CUDA_CHECK(cudaMalloc(&d_values, part.local_node_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_current_values, part.local_node_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_next_values, part.local_node_count * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_local_outdegree, part.local_node_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_row_offsets, (part.owned_count + 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_column_indices, part.column_indices.size() * sizeof(int)));
@@ -336,7 +346,7 @@ inline void pagerankMultiGPU(
     }
     std::vector<int> h_active(part.owned_count, 1);
 
-    CUDA_CHECK(cudaMemcpy(d_values, h_local_value.data(), part.local_node_count * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_current_values, h_local_value.data(), part.local_node_count * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_local_outdegree, h_local_outdegree.data(), part.local_node_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_row_offsets, part.row_offsets.data(), (part.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_column_indices, part.column_indices.data(), part.column_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
@@ -349,7 +359,7 @@ inline void pagerankMultiGPU(
     CUDA_CHECK(cudaStreamCreate(&compute_stream));
     CUDA_CHECK(cudaStreamCreateWithFlags(&check_stream, cudaStreamNonBlocking));
     dg_nccl_exchange_float_values(
-        d_values, plans, world_size, rank, comm, compute_stream);
+        d_current_values, plans, world_size, rank, comm, compute_stream);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 
     SpscQueue<int, PR_DIST_CHECK_BUFFER_COUNT> free_check_buffers;
@@ -409,10 +419,15 @@ inline void pagerankMultiGPU(
     while (iter < PR_DIST_MAX_ITERATIONS && total_active > 0) {
         ++iter;
         phase_timer.start_pre(compute_stream);
+        // Retain inactive values while the pull kernel updates the active set.
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_next_values, d_current_values,
+            part.local_node_count * sizeof(float), cudaMemcpyDeviceToDevice,
+            compute_stream));
         CUDA_CHECK(cudaMemsetAsync(
             d_active_count, 0, sizeof(int), compute_stream));
         pagerankDistributedScoreAndMarkKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, compute_stream>>>(
-            d_active, d_values, d_row_offsets, part.owned_count, max_outdegree,
+            d_active, d_current_values, d_row_offsets, part.owned_count, max_outdegree,
             alpha, beta, threshold, d_active_count);
 
         int check_buffer = -1;
@@ -424,7 +439,8 @@ inline void pagerankMultiGPU(
             sizeof(PagerankDistributedCheckInfo), compute_stream));
         CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, compute_stream));
         pagerankDistributedToleranceKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, compute_stream>>>(
-            d_values, d_local_outdegree, d_row_offsets, d_column_indices, d_column_offsets, d_row_indices,
+            d_current_values, d_next_values, d_local_outdegree, d_row_offsets,
+            d_column_indices, d_column_offsets, d_row_indices,
             d_active, d_update, part.owned_count, part.local_node_count,
             iteration_check_info);
         CUDA_CHECK(graph_cuda_timer_stop(&graph_kernel_timer, compute_stream));
@@ -462,7 +478,7 @@ inline void pagerankMultiGPU(
         dg_nccl_exchange_activation(
             d_update, d_active, plans, world_size, rank, comm, compute_stream);
         dg_nccl_exchange_float_values(
-            d_values, plans, world_size, rank, comm, compute_stream);
+            d_next_values, plans, world_size, rank, comm, compute_stream);
         phase_timer.stop_comm(compute_stream);
 
         phase_timer.start_post(compute_stream);
@@ -482,6 +498,7 @@ inline void pagerankMultiGPU(
         phase_timer.accumulate(timing.gpu_compute_ms, timing.nccl_exchange_ms);
         CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
 
+        std::swap(d_current_values, d_next_values);
         dg_timed_allreduce(
             &local_active, &total_active, 1, MPI_INT, MPI_SUM,
             MPI_COMM_WORLD, timing.mpi_sync_ms);
@@ -563,7 +580,7 @@ inline void pagerankMultiGPU(
     dg_report_benchmark_timing(timing, rank, world_size);
 
     std::vector<float> h_owned(part.owned_count);
-    CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_owned.data(), d_current_values, part.owned_count * sizeof(float), cudaMemcpyDeviceToHost));
     std::vector<int> counts = dg_owned_counts(world_size, num_nodes);
     std::vector<int> displs = dg_displacements(counts);
     MPI_Allgatherv(h_owned.data(), part.owned_count, MPI_FLOAT,
@@ -588,7 +605,8 @@ inline void pagerankMultiGPU(
     CUDA_CHECK(cudaStreamDestroy(check_stream));
     CUDA_CHECK(cudaStreamDestroy(compute_stream));
     dg_free_peer_plans(plans);
-    cudaFree(d_values);
+    cudaFree(d_current_values);
+    cudaFree(d_next_values);
     cudaFree(d_local_outdegree);
     cudaFree(d_row_offsets);
     cudaFree(d_column_indices);

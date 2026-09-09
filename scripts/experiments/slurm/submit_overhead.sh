@@ -1,231 +1,167 @@
 #!/usr/bin/env bash
-# Submit dataset x algorithm work items as fixed two-GPU Slurm array tasks.
+# Prepare one immutable experiment run and submit dataset × algorithm array work.
 
-set -euo pipefail
+set -eo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_root="$(cd "${script_dir}/../../.." && pwd)"
+script_dir="$(cd "$(dirname "$BASH_SOURCE")" && pwd)"
+project_root="$(cd "$script_dir/../../.." && pwd)"
+python_bin="${PYTHON_BIN:-}"
+config="${CONFIG:-}"
+run_tag="${RUN_TAG:-}"
+run_root="${RUN_ROOT:-}"
+array_concurrency="${ARRAY_CONCURRENCY:-}"
+resume="${RESUME:-0}"
+retry_failed="${RETRY_FAILED:-0}"
+[[ -z "$python_bin" ]] && python_bin="$project_root/.venv/bin/python"
+[[ -z "$config" ]] && config="$project_root/scripts/experiments/configs/overhead.json"
+[[ -z "$run_tag" ]] && run_tag="overhead_$(date +%Y%m%d_%H%M%S)"
+[[ -z "$run_root" ]] && run_root="$project_root/outputs/experiments/$run_tag"
+[[ -z "$array_concurrency" ]] && array_concurrency=1
 
-RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-${project_root}/outputs/experiments/${RUN_TAG}}"
-ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-1}"
-REPEAT="${REPEAT:-5}"
-WARMUP="${WARMUP:-1}"
-TIMEOUT="${TIMEOUT:-3600}"
-MPI_RANKS="${MPI_RANKS:-2}"
-PYTHON_MODE="${PYTHON_MODE:-auto}"
-PYTHON_BIN="${PYTHON_BIN:-}"
-UV_BIN="${UV_BIN:-}"
-ALLOW_EXISTING_RUN_ROOT="${ALLOW_EXISTING_RUN_ROOT:-0}"
-
-require_nonnegative_integer() {
-    local name="$1"
-    local value="$2"
-    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-        echo "${name} must be a non-negative integer, got: ${value}" >&2
-        exit 2
-    fi
-}
-
-require_positive_integer() {
-    local name="$1"
-    local value="$2"
-    require_nonnegative_integer "${name}" "${value}"
-    if [[ "${value}" -eq 0 ]]; then
-        echo "${name} must be greater than zero." >&2
-        exit 2
-    fi
-}
-
-require_positive_integer ARRAY_CONCURRENCY "${ARRAY_CONCURRENCY}"
-require_positive_integer REPEAT "${REPEAT}"
-require_nonnegative_integer WARMUP "${WARMUP}"
-require_positive_integer TIMEOUT "${TIMEOUT}"
-if [[ "${MPI_RANKS}" -ne 2 ]]; then
-    echo "This workflow is fixed to exactly two MPI ranks and two GPUs." >&2
+if [[ ! -x "$python_bin" ]]; then
+    echo "Missing executable Python: $python_bin" >&2
+    echo "Use the uv-created local environment or set PYTHON_BIN." >&2
     exit 2
 fi
-if [[ "${ALLOW_EXISTING_RUN_ROOT}" != "0" && \
-      "${ALLOW_EXISTING_RUN_ROOT}" != "1" ]]; then
-    echo "ALLOW_EXISTING_RUN_ROOT must be 0 or 1." >&2
-    exit 2
-fi
-if [[ -s "${RUN_ROOT}/work_items.tsv" && \
-      "${ALLOW_EXISTING_RUN_ROOT}" != "1" ]]; then
-    echo "Refusing to reuse populated run root: ${RUN_ROOT}" >&2
-    echo "Choose a new RUN_TAG, or explicitly set ALLOW_EXISTING_RUN_ROOT=1." >&2
-    exit 2
-fi
-
-case "${PYTHON_MODE}" in
-    auto)
-        if [[ -n "${PYTHON_BIN}" ]]; then
-            PYTHON_MODE="binary"
-        elif [[ -x "${project_root}/.venv/bin/python" ]]; then
-            PYTHON_MODE="binary"
-            PYTHON_BIN="${project_root}/.venv/bin/python"
-        elif command -v uv >/dev/null 2>&1; then
-            PYTHON_MODE="uv"
-            UV_BIN="$(command -v uv)"
-        else
-            echo "No usable .venv/bin/python or uv executable found." >&2
-            exit 2
-        fi
-        ;;
-    venv)
-        PYTHON_MODE="binary"
-        PYTHON_BIN="${PYTHON_BIN:-${project_root}/.venv/bin/python}"
-        ;;
-    binary)
-        PYTHON_BIN="${PYTHON_BIN:-${project_root}/.venv/bin/python}"
-        ;;
-    uv)
-        UV_BIN="${UV_BIN:-$(command -v uv || true)}"
-        ;;
-    *)
-        echo "PYTHON_MODE must be auto, venv, binary, or uv." >&2
-        exit 2
-        ;;
-esac
-
-if [[ "${PYTHON_MODE}" == "binary" ]]; then
-    if [[ ! -x "${PYTHON_BIN}" ]]; then
-        echo "Python interpreter is not executable: ${PYTHON_BIN}" >&2
-        echo "Run 'uv venv', or set PYTHON_MODE=uv/PYTHON_BIN." >&2
-        exit 2
-    fi
-    python_check=("${PYTHON_BIN}")
-else
-    if [[ -z "${UV_BIN}" || ! -x "${UV_BIN}" ]]; then
-        echo "uv executable is not available: ${UV_BIN:-<empty>}" >&2
-        exit 2
-    fi
-    python_check=("${UV_BIN}" run python)
-fi
-
-cd "${project_root}"
-"${python_check[@]}" -c 'import sys; assert sys.version_info >= (3, 9)'
-"${python_check[@]}" -c 'import matplotlib'
-if ! command -v mpirun >/dev/null 2>&1; then
-    echo "mpirun was not found in PATH." >&2
+if [[ ! -f "$config" ]]; then
+    echo "Missing experiment config: $config" >&2
     exit 2
 fi
 if ! command -v sbatch >/dev/null 2>&1; then
     echo "sbatch was not found in PATH." >&2
     exit 2
 fi
+if [[ ! "$array_concurrency" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ARRAY_CONCURRENCY must be a positive integer." >&2
+    exit 2
+fi
+if [[ ! "$resume" =~ ^[01]$ || ! "$retry_failed" =~ ^[01]$ ]]; then
+    echo "RESUME and RETRY_FAILED must be 0 or 1." >&2
+    exit 2
+fi
 
-expected_binaries=(
-    "build/bin/bfs/bfs"
-    "build/bin/bfs/bfs_queue"
-    "build/bin/bfs/bfs_multiGPU_basic"
-    "build/bin/bfs/bfs_multiGPU"
-    "build/bin/cc/cc"
-    "build/bin/cc/cc_queue"
-    "build/bin/cc/cc_multiGPU_basic"
-    "build/bin/cc/cc_multiGPU"
-    "build/bin/kcore/kcore"
-    "build/bin/kcore/kcore_queue"
-    "build/bin/kcore/kcore_multiGPU_basic"
-    "build/bin/kcore/kcore_multiGPU"
-    "build/bin/pagerank/pagerank"
-    "build/bin/pagerank/pagerank_queue"
-    "build/bin/pagerank/pagerank_multiGPU_basic"
-    "build/bin/pagerank/pagerank_multiGPU"
+prepare_args=(
+    scripts/experiments/prepare_run.py
+    --config "$config"
+    --run-dir "$run_root"
 )
-missing_binaries=0
-for executable in "${expected_binaries[@]}"; do
-    if [[ ! -x "${project_root}/${executable}" ]]; then
-        echo "Missing/non-executable benchmark binary: ${executable}" >&2
-        missing_binaries="$((missing_binaries + 1))"
+[[ -n "${REPEAT:-}" ]] && prepare_args+=(--repeat "$REPEAT")
+[[ -n "${WARMUP:-}" ]] && prepare_args+=(--warmup "$WARMUP")
+[[ -n "${TIMEOUT:-}" ]] && prepare_args+=(--timeout "$TIMEOUT")
+[[ -n "${MPI_RANKS:-}" ]] && prepare_args+=(--mpi-ranks "$MPI_RANKS")
+if [[ -n "${DATASETS:-}" ]]; then
+    read -r -a chosen_datasets <<< "$DATASETS"
+    prepare_args+=(--datasets "${chosen_datasets[@]}")
+fi
+if [[ -n "${ALGORITHMS:-}" ]]; then
+    read -r -a chosen_algorithms <<< "$ALGORITHMS"
+    prepare_args+=(--algorithms "${chosen_algorithms[@]}")
+fi
+[[ "${FAST_FINGERPRINTS:-}" == "1" ]] && prepare_args+=(--fast-fingerprints)
+
+cd "$project_root"
+if [[ -e "$run_root" ]]; then
+    if [[ "$resume" != "1" ]]; then
+        echo "RUN_ROOT already exists: $run_root" >&2
+        echo "Use a new RUN_TAG/RUN_ROOT, or set RESUME=1 to reuse its immutable manifest." >&2
+        exit 2
     fi
-done
-if [[ "${missing_binaries}" -ne 0 ]]; then
-    echo "Build all 16 benchmark targets before submitting." >&2
+    if [[ ! -f "$run_root/manifest/experiment.json" ]]; then
+        echo "RESUME=1 requires a prepared manifest: $run_root/manifest/experiment.json" >&2
+        exit 2
+    fi
+    echo "Reusing immutable manifest with --resume: $run_root"
+else
+    if [[ "$resume" == "1" ]]; then
+        echo "RESUME=1 was requested but RUN_ROOT does not exist: $run_root" >&2
+        exit 2
+    fi
+    if ! "$python_bin" "${prepare_args[@]}"; then
+        echo "Manifest preparation failed; no Slurm jobs were submitted." >&2
+        exit 2
+    fi
+fi
+
+manifest_values="$("$python_bin" -c 'import json, sys; manifest = json.load(open(sys.argv[1], encoding="utf-8")); config = manifest["config"]; print(manifest["work_item_count"], config["repeat"], config["warmup"], len(config["methods"]), config["timeout_s"], config["mpi_ranks"])' "$run_root/manifest/experiment.json")"
+read -r work_count repeat warmup method_count timeout_s mpi_ranks <<< "$manifest_values"
+if ! [[ "$work_count" =~ ^[1-9][0-9]*$ && "$repeat" =~ ^[1-9][0-9]*$ && "$warmup" =~ ^[0-9]+$ && "$method_count" =~ ^[1-9][0-9]*$ && "$timeout_s" =~ ^[1-9][0-9]*$ && "$mpi_ranks" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Prepared manifest has invalid work/time settings: $manifest_values" >&2
     exit 2
 fi
 
-if [[ ! -f "${project_root}/dataset/metadata.csv" ]]; then
-    echo "Missing dataset/metadata.csv." >&2
-    echo "Run: uv run python scripts/utils/select_source_nodes.py --top-k 10" >&2
-    exit 2
-fi
+format_slurm_time() {
+    local total_seconds="$1"
+    local days=$((total_seconds / 86400))
+    local remainder=$((total_seconds % 86400))
+    local hours=$((remainder / 3600))
+    remainder=$((remainder % 3600))
+    local minutes=$((remainder / 60))
+    local seconds=$((remainder % 60))
+    if (( days > 0 )); then
+        printf '%d-%02d:%02d:%02d' "$days" "$hours" "$minutes" "$seconds"
+    else
+        printf '%02d:%02d:%02d' "$hours" "$minutes" "$seconds"
+    fi
+}
 
-mkdir -p "${RUN_ROOT}/runs" "${RUN_ROOT}/slurm"
-find "${project_root}/dataset" -maxdepth 1 -type f -name '*.mtx' -printf '%f\n' \
-    | sed 's/\.mtx$//' | sort > "${RUN_ROOT}/datasets.txt"
-dataset_count="$(wc -l < "${RUN_ROOT}/datasets.txt")"
-if [[ "${dataset_count}" -eq 0 ]]; then
-    echo "No dataset/*.mtx files found." >&2
-    exit 2
-fi
+invocations_per_item=$(((repeat + warmup) * method_count))
+worst_case_seconds=$((invocations_per_item * timeout_s + 600))
+computed_worker_time="$(format_slurm_time "$worst_case_seconds")"
+worker_time="${WORKER_TIME:-$computed_worker_time}"
+collector_time="${COLLECTOR_TIME:-01:00:00}"
+last_index=$((work_count - 1))
+mkdir -p "$run_root/slurm"
 
-metadata_count="$(tail -n +2 "${project_root}/dataset/metadata.csv" | wc -l)"
-source_count="$(
-    find "${project_root}/dataset/sources" -maxdepth 1 \
-        -type f -name '*_sources.tsv' | wc -l
-)"
-if [[ "${metadata_count}" -ne "${dataset_count}" || \
-      "${source_count}" -ne "${dataset_count}" ]]; then
-    echo "Dataset preparation is incomplete: mtx=${dataset_count}, metadata=${metadata_count}, sources=${source_count}." >&2
-    echo "Run: uv run python scripts/utils/select_source_nodes.py --top-k 10" >&2
-    exit 2
-fi
+sbatch_options=()
+[[ -n "${PARTITION:-}" ]] && sbatch_options+=(--partition "$PARTITION")
+[[ -n "${ACCOUNT:-}" ]] && sbatch_options+=(--account "$ACCOUNT")
+[[ -n "${QOS:-}" ]] && sbatch_options+=(--qos "$QOS")
 
-work_items="${RUN_ROOT}/work_items.tsv"
-printf 'algorithm\tdataset\trepeat\n' > "${work_items}"
-while IFS= read -r dataset; do
-    for algorithm in bfs cc kcore pagerank; do
-        printf '%s\t%s\t%s\n' \
-            "${algorithm}" "${dataset}" "${REPEAT}" >> "${work_items}"
-    done
-done < "${RUN_ROOT}/datasets.txt"
-
-work_count="$(( $(wc -l < "${work_items}") - 1 ))"
-if [[ "${work_count}" -ne "$((dataset_count * 4))" ]]; then
-    echo "Internal error while generating work_items.tsv." >&2
-    exit 2
-fi
-last_index="$((work_count - 1))"
-
-sbatch_extra=()
-if [[ -n "${PARTITION:-}" ]]; then
-    sbatch_extra+=(--partition "${PARTITION}")
-fi
-if [[ -n "${ACCOUNT:-}" ]]; then
-    sbatch_extra+=(--account "${ACCOUNT}")
-fi
-if [[ -n "${QOS:-}" ]]; then
-    sbatch_extra+=(--qos "${QOS}")
-fi
-
-for export_value in \
-    "${project_root}" "${RUN_ROOT}" "${PYTHON_BIN}" "${UV_BIN}"; do
-    if [[ "${export_value}" == *","* || "${export_value}" == *$'\n'* ]]; then
-        echo "Slurm export values must not contain commas/newlines: ${export_value}" >&2
+for export_value in "$project_root" "$run_root" "$python_bin" "$retry_failed"; do
+    if [[ "$export_value" == *","* || "$export_value" == *$'
+'* ]]; then
+        echo "Slurm export values cannot contain commas or newlines: $export_value" >&2
         exit 2
     fi
 done
+exports="ALL,PROJECT_ROOT=$project_root,RUN_ROOT=$run_root,PYTHON_BIN=$python_bin,RETRY_FAILED=$retry_failed"
 
-export_values="ALL,PROJECT_ROOT=${project_root},RUN_ROOT=${RUN_ROOT},REPEAT=${REPEAT},WARMUP=${WARMUP},TIMEOUT=${TIMEOUT},MPI_RANKS=2,PYTHON_MODE=${PYTHON_MODE},PYTHON_BIN=${PYTHON_BIN},UV_BIN=${UV_BIN}"
-worker_job="$(sbatch --parsable \
-    "${sbatch_extra[@]}" \
-    --array="0-${last_index}%${ARRAY_CONCURRENCY}" \
-    --output="${RUN_ROOT}/slurm/%A_%a.out" \
-    --error="${RUN_ROOT}/slurm/%A_%a.err" \
-    --export="${export_values}" \
-    "${script_dir}/run_overhead.sbatch")"
+if ! worker_job="$(sbatch --parsable "${sbatch_options[@]}" \
+    --time="$worker_time" \
+    --ntasks="$mpi_ranks" \
+    --gpus-per-node="$mpi_ranks" \
+    --array="0-$last_index%$array_concurrency" \
+    --output="$run_root/slurm/%A_%a.out" \
+    --error="$run_root/slurm/%A_%a.err" \
+    --export="$exports" \
+    "$script_dir/run_item.sbatch")"; then
+    echo "Worker array submission failed; collector was not submitted." >&2
+    exit 3
+fi
+if [[ -z "$worker_job" ]]; then
+    echo "Worker array submission returned an empty job ID; collector was not submitted." >&2
+    exit 3
+fi
+if ! collector_job="$(sbatch --parsable "${sbatch_options[@]}" \
+    --time="$collector_time" \
+    --dependency="afterany:$worker_job" \
+    --output="$run_root/slurm/collect-%j.out" \
+    --error="$run_root/slurm/collect-%j.err" \
+    --export="$exports" \
+    "$script_dir/collect.sbatch")"; then
+    echo "Collector submission failed after worker array $worker_job was submitted." >&2
+    exit 3
+fi
+if [[ -z "$collector_job" ]]; then
+    echo "Collector submission returned an empty job ID." >&2
+    exit 3
+fi
 
-collector_job="$(sbatch --parsable \
-    "${sbatch_extra[@]}" \
-    --dependency="afterany:${worker_job}" \
-    --output="${RUN_ROOT}/slurm/collect-%j.out" \
-    --error="${RUN_ROOT}/slurm/collect-%j.err" \
-    --export="${export_values}" \
-    "${script_dir}/collect_overhead.sbatch")"
-
-echo "run root:       ${RUN_ROOT}"
-echo "work items:     ${work_count} (${dataset_count} datasets x 4 algorithms)"
-echo "array job:      ${worker_job} (0-${last_index}%${ARRAY_CONCURRENCY})"
-echo "collector job:  ${collector_job}"
-echo "python mode:    ${PYTHON_MODE}"
+echo "run root:      $run_root"
+echo "work items:    $work_count (dataset × algorithm)"
+echo "array job:     $worker_job (0-$last_index%$array_concurrency)"
+echo "collector job: $collector_job"
+echo "worker time:   $worker_time (worst-case command budget: $computed_worker_time)"
+echo "MPI ranks:     $mpi_ranks (worker allocation requests the same GPU count on one node)"
+echo "retry failed:  $retry_failed"
+echo "Note: PARTITION, ACCOUNT and QOS are optional environment variables; no account is forced."

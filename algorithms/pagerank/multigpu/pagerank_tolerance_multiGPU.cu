@@ -51,7 +51,12 @@ int scoreAndMarkCPU(std::vector<int>& active,
     return active_count;
 }
 
-/** @brief Run the serial reference using the same active-set PageRank formula. */
+/**
+ * @brief Run the serial reference using the same snapshot active-set formula.
+ *
+ * Each iteration reads @c value and writes @c next_value, mirroring the GPU
+ * double-buffer contract. Inactive vertices are copied forward unchanged.
+ */
 void pagerankCPU(const CsrGraph& graph,
                  float* out,
                  float alpha,
@@ -59,6 +64,7 @@ void pagerankCPU(const CsrGraph& graph,
                  float threshold) {
     const int n = graph.nodes;
     std::vector<float> value(n, 1.0f / (float)n);
+    std::vector<float> next_value(value);
     std::vector<int> active(n, 1);
     std::vector<int> update(n, -1);
 
@@ -66,6 +72,7 @@ void pagerankCPU(const CsrGraph& graph,
     int active_count = scoreAndMarkCPU(active, value, graph, max_outdegree, alpha, beta, threshold);
 
     for (int iter = 0; iter < 1000 && active_count > 0; ++iter) {
+        next_value = value;
         std::fill(update.begin(), update.end(), -1);
         for (int v = 0; v < n; ++v) {
             if (active[v] == -1) continue;
@@ -77,7 +84,7 @@ void pagerankCPU(const CsrGraph& graph,
             }
             float new_value = (1.0f - kPrAlpha) + kPrAlpha * sum;
             float delta = std::fabs(new_value - value[v]);
-            value[v] = new_value;
+            next_value[v] = new_value;
             if (delta >= kPrTol) {
                 for (int e = graph.row_offsets[v]; e < graph.row_offsets[v + 1]; ++e) {
                     update[graph.column_indices[e]] = 1;
@@ -85,6 +92,7 @@ void pagerankCPU(const CsrGraph& graph,
             }
         }
         active.swap(update);
+        value.swap(next_value);
         active_count = scoreAndMarkCPU(active, value, graph, max_outdegree, alpha, beta, threshold);
     }
 
@@ -92,11 +100,11 @@ void pagerankCPU(const CsrGraph& graph,
 }
 
 /**
- * @brief Compare serial and distributed in-place PageRank values.
+ * @brief Compare serial and distributed snapshot PageRank values.
  *
- * Rank scheduling changes the order of in-place floating-point updates. Use a
- * mixed absolute/relative bound so large scores are not rejected for a tiny
- * relative difference after both executions satisfy the same residual limit.
+ * MPI partitioning changes active-set scheduling order. Use a mixed
+ * absolute/relative bound so numerically close converged scores are not
+ * rejected for a tiny floating-point difference.
  */
 bool correctTest(int n, const float* ref, const float* gpu) {
     bool pass = true;

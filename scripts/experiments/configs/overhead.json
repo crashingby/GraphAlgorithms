@@ -1,0 +1,44 @@
+{
+  "name": "fault_tolerance_overhead",
+  "datasets": [
+    "cit-HepPh",
+    "ia-enron-email-dynamic",
+    "roadNet-CA",
+    "soc-BlogCatalog",
+    "soc-Epinions1",
+    "soc-LiveJournal1",
+    "soc-LiveMocha",
+    "soc-Slashdot0811",
+    "soc-buzznet",
+    "soc-catster",
+    "soc-flickr",
+    "soc-themarker",
+    "socfb-Harvard1",
+    "socfb-Indiana69",
+    "socfb-Oklahoma97",
+    "socfb-Penn94",
+    "socfb-Texas84",
+    "socfb-UF21",
+    "tech-RL-caida",
+    "web-Google",
+    "web-NotreDame",
+    "web-Stanford"
+  ],
+  "algorithms": ["bfs", "cc", "kcore", "pagerank"],
+  "methods": ["basic", "tolerance_queue", "multigpu_basic", "multigpu"],
+  "repeat": 5,
+  "warmup": 1,
+  "timeout_s": 3600,
+  "mpi_ranks": 2,
+  "parameters": {
+    "k": 5,
+    "alpha": 0.5,
+    "beta": 0.5,
+    "threshold": 0.3
+  },
+  "launcher": {
+    "command": "mpirun",
+    "ranks_flag": "-np",
+    "extra_args": ["--bind-to", "none"]
+  }
+}

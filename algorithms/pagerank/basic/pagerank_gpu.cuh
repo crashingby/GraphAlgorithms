@@ -13,17 +13,27 @@
 
 #define INF 100000
 #define BLOCK_SIZE 256
-#define ALPHA  0.85   //PageRank 的阻尼因子（一般为 0.85）
+#define ALPHA  0.85f  // PageRank damping factor; match all checked variants.
 #define tol  1e-3f
 
 /**
- * @brief Perform one in-place PageRank pull iteration on active vertices.
- * @param d_values In-place rank values.
+ * @brief Perform one snapshot PageRank pull iteration on active vertices.
+ *
+ * Every thread reads rank values solely from @p d_current_values and writes
+ * authoritative updates solely to @p d_next_values. The caller copies the
+ * current buffer into the next buffer before the launch, preserving inactive
+ * vertices, and swaps the two buffers only after the iteration completes.
+ * This prevents inter-block read/write races from changing an iteration's
+ * input snapshot.
+ *
+ * @param d_current_values Read-only rank values for the current iteration.
+ * @param d_next_values Rank values produced for the next iteration.
  * @param d_active Current work-set bitmap; zero means inactive.
  * @param d_update Next-iteration work-set bitmap.
  */
 __global__ void pagerankPullKernel(
-    float* d_values,
+    const float* d_current_values,
+    float* d_next_values,
     const int* d_row_offsets,
     const int* d_column_indices,
     const int* d_column_offsets,
@@ -35,7 +45,7 @@ __global__ void pagerankPullKernel(
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= num_nodes || d_active[tid] == 0) return;
     
-    float oldVal = d_values[tid];
+    float oldVal = d_current_values[tid];
     float sum = 0.0f;
     
     // 遍历入边，汇总邻居贡献
@@ -43,12 +53,12 @@ __global__ void pagerankPullKernel(
       int neighbor = d_row_indices[i];
       int outDegree = d_row_offsets[neighbor + 1] - d_row_offsets[neighbor];
       if(outDegree > 0)
-          sum += d_values[neighbor] / (float)outDegree;
+          sum += d_current_values[neighbor] / (float)outDegree;
       
     }
 
     float newVal = (1.0f - ALPHA) + ALPHA * sum;
-    d_values[tid] = newVal;
+    d_next_values[tid] = newVal;
 
     // 当变化较大时，通知出边邻居成为下轮活跃
     if (fabsf(newVal - oldVal) >= tol) {
@@ -104,9 +114,10 @@ void pagerankGPU(
     int *d_row_offsets, *d_column_indices;
     int *d_column_offsets, *d_row_indices, *d_active, *d_update;
     int *d_num_active;
-    float *d_values;
+    float *d_current_values, *d_next_values;
 
-    cudaMalloc(&d_values, num_nodes * sizeof(float));
+    cudaMalloc(&d_current_values, num_nodes * sizeof(float));
+    cudaMalloc(&d_next_values, num_nodes * sizeof(float));
     cudaMalloc(&d_row_offsets, (num_nodes+1) * sizeof(int));
     cudaMalloc(&d_column_indices, num_edges * sizeof(int));
     cudaMalloc(&d_column_offsets, (num_nodes+1) * sizeof(int));
@@ -115,7 +126,7 @@ void pagerankGPU(
     cudaMalloc(&d_update, num_nodes * sizeof(int));
     cudaMalloc(&d_num_active, sizeof(int));
 
-    cudaMemcpy(d_values, h_value, num_nodes*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_current_values, h_value, num_nodes*sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_row_offsets, h_row_offsets, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_column_indices, h_column_indices, num_edges*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_column_offsets, h_column_offsets, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
@@ -140,9 +151,13 @@ void pagerankGPU(
         iter++;
 
         // 执行拉模式核函数
+        // Preserve inactive ranks; the pull kernel writes only active vertices.
+        cudaMemcpy(d_next_values, d_current_values, num_nodes * sizeof(float),
+                   cudaMemcpyDeviceToDevice);
+
         graph_cuda_timer_start(&graph_kernel_timer);
         pagerankPullKernel<<<num_blocks, BLOCK_SIZE>>>(
-            d_values, d_row_offsets, d_column_indices,
+            d_current_values, d_next_values, d_row_offsets, d_column_indices,
             d_column_offsets, d_row_indices,
             d_active, d_update, num_nodes
         );
@@ -161,10 +176,15 @@ void pagerankGPU(
         );
         cudaMemcpy(&active_nodes, d_num_active, sizeof(int), cudaMemcpyDeviceToHost);
 
+        // The next round must observe one complete, immutable rank snapshot.
+        float* completed_values = d_current_values;
+        d_current_values = d_next_values;
+        d_next_values = completed_values;
+
     }
 
     // ------------------- 拷贝结果回 Host -------------------
-    cudaMemcpy(h_value, d_values, num_nodes*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_value, d_current_values, num_nodes*sizeof(float), cudaMemcpyDeviceToHost);
 
        // 记录结束事件
     cudaEventRecord(stop);
@@ -181,7 +201,7 @@ void pagerankGPU(
     graph_cuda_timer_destroy(&graph_kernel_timer);
     
     // ------------------- 释放内存 -------------------
-    cudaFree(d_values); cudaFree(d_row_offsets); cudaFree(d_column_indices);
+    cudaFree(d_current_values); cudaFree(d_next_values); cudaFree(d_row_offsets); cudaFree(d_column_indices);
     cudaFree(d_column_offsets); cudaFree(d_row_indices);
     cudaFree(d_active); cudaFree(d_update);
     cudaFree(d_num_active);

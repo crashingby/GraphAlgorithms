@@ -12,6 +12,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <utility>
 #include <vector>
 
 #include "include/distributed_benchmark.cuh"
@@ -21,14 +22,16 @@
 #define PR_MN_TOL 1e-3f
 
 /**
- * @brief Update owned PageRank values from owned and ghost predecessors.
- * @param values Owned-plus-ghost rank cache.
+ * @brief Update owned PageRank values from a distributed immutable snapshot.
+ * @param current_values Owned-plus-ghost rank cache for the current round.
+ * @param next_values Owned-plus-ghost rank cache for the next round.
  * @param local_outdegree Outdegree for each local owned or ghost vertex.
  * @param active Work set for owned vertices only; -1 means inactive.
  * @param update Next work set over owned and ghost vertices.
  */
 __global__ void pagerankDistributedPullKernel(
-    float* values,
+    const float* current_values,
+    float* next_values,
     const int* local_outdegree,
     const int* row_offsets,
     const int* column_indices,
@@ -42,19 +45,19 @@ __global__ void pagerankDistributedPullKernel(
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= owned_count || active[tid] == -1) return;
 
-    float old_value = values[tid];
+    float old_value = current_values[tid];
     float sum = 0.0f;
 
     for (int e = column_offsets[tid]; e < column_offsets[tid + 1]; ++e) {
         int src = row_indices[e];
         if (src >= 0 && src < local_node_count) {
             int outdegree = local_outdegree[src];
-            if (outdegree > 0) sum += values[src] / (float)outdegree;
+            if (outdegree > 0) sum += current_values[src] / (float)outdegree;
         }
     }
 
     float new_value = (1.0f - PR_MN_ALPHA) + PR_MN_ALPHA * sum;
-    values[tid] = new_value;
+    next_values[tid] = new_value;
 
     if (fabsf(new_value - old_value) >= PR_MN_TOL) {
         for (int e = row_offsets[tid]; e < row_offsets[tid + 1]; ++e) {
@@ -118,7 +121,8 @@ inline void pagerankMultiGPUBasic(
     std::vector<DgPeerPlanDevice> plans;
     dg_upload_peer_plans(host_plans, rank, world_size, plans, true);
 
-    float* d_values = nullptr;
+    float* d_current_values = nullptr;
+    float* d_next_values = nullptr;
     int *d_local_outdegree = nullptr;
     int *d_row_offsets = nullptr;
     int *d_column_indices = nullptr;
@@ -128,7 +132,8 @@ inline void pagerankMultiGPUBasic(
     int *d_update = nullptr;
     int *d_active_count = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_values, part.local_node_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_current_values, part.local_node_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_next_values, part.local_node_count * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_local_outdegree, part.local_node_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_row_offsets, (part.owned_count + 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_column_indices, part.column_indices.size() * sizeof(int)));
@@ -146,7 +151,7 @@ inline void pagerankMultiGPUBasic(
     }
     std::vector<int> h_active(part.owned_count, 1);
 
-    CUDA_CHECK(cudaMemcpy(d_values, h_local_value.data(), part.local_node_count * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_current_values, h_local_value.data(), part.local_node_count * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_local_outdegree, h_local_outdegree.data(), part.local_node_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_row_offsets, part.row_offsets.data(), (part.owned_count + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_column_indices, part.column_indices.data(), part.column_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
@@ -159,7 +164,7 @@ inline void pagerankMultiGPUBasic(
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     // Match the tolerance multiGPU timing boundary: warm up/synchronize ghost values before timing.
-    dg_nccl_exchange_float_values(d_values, plans, world_size, rank, comm, stream);
+    dg_nccl_exchange_float_values(d_current_values, plans, world_size, rank, comm, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     DgIterationPhaseTimer phase_timer;
@@ -173,9 +178,15 @@ inline void pagerankMultiGPUBasic(
     while (iter < 1000 && total_active > 0) {
         ++iter;
         phase_timer.start_pre(stream);
+        // Preserve inactive values; the pull kernel writes active vertices only.
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_next_values, d_current_values,
+            part.local_node_count * sizeof(float), cudaMemcpyDeviceToDevice,
+            stream));
         CUDA_CHECK(graph_cuda_timer_start(&graph_kernel_timer, stream));
         pagerankDistributedPullKernel<<<dg_blocks(part.owned_count), DG_BLOCK_SIZE, 0, stream>>>(
-            d_values,
+            d_current_values,
+            d_next_values,
             d_local_outdegree,
             d_row_offsets,
             d_column_indices,
@@ -197,7 +208,7 @@ inline void pagerankMultiGPUBasic(
         phase_timer.stop_pre(stream);
         phase_timer.start_comm(stream);
         dg_nccl_exchange_activation(d_update, d_active, plans, world_size, rank, comm, stream);
-        dg_nccl_exchange_float_values(d_values, plans, world_size, rank, comm, stream);
+        dg_nccl_exchange_float_values(d_next_values, plans, world_size, rank, comm, stream);
         phase_timer.stop_comm(stream);
 
         phase_timer.start_post(stream);
@@ -218,6 +229,7 @@ inline void pagerankMultiGPUBasic(
         phase_timer.accumulate(timing.gpu_compute_ms, timing.nccl_exchange_ms);
         CUDA_CHECK(graph_cuda_timer_accumulate(&graph_kernel_timer));
 
+        std::swap(d_current_values, d_next_values);
         const double mpi_sync_start = MPI_Wtime();
         MPI_Allreduce(
             &local_active, &total_active, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -230,7 +242,7 @@ inline void pagerankMultiGPUBasic(
     dg_report_benchmark_timing(timing, rank, world_size);
 
     std::vector<float> h_owned(part.owned_count);
-    CUDA_CHECK(cudaMemcpy(h_owned.data(), d_values, part.owned_count * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_owned.data(), d_current_values, part.owned_count * sizeof(float), cudaMemcpyDeviceToHost));
 
     std::vector<int> counts = dg_owned_counts(world_size, num_nodes);
     std::vector<int> displs = dg_displacements(counts);
@@ -246,7 +258,8 @@ inline void pagerankMultiGPUBasic(
     CUDA_CHECK(graph_cuda_timer_destroy(&graph_kernel_timer));
     CUDA_CHECK(cudaStreamDestroy(stream));
     dg_free_peer_plans(plans);
-    cudaFree(d_values);
+    cudaFree(d_current_values);
+    cudaFree(d_next_values);
     cudaFree(d_local_outdegree);
     cudaFree(d_row_offsets);
     cudaFree(d_column_indices);

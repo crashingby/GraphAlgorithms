@@ -100,7 +100,8 @@ void kcoreGPU(
     for(int i=0;i<num_nodes;i++){
         h_active[i] = 1;      // 第一轮所有顶点活跃
         h_alive[i] = 1;
-        h_value[i] = h_row_offsets[i + 1] - h_row_offsets[i];
+        /** @brief Match the pull kernel's directed incoming-live-neighbor recount. */
+        h_value[i] = h_column_offsets[i + 1] - h_column_offsets[i];
     }
 
 

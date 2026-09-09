@@ -12,7 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <mpi.h>
 
 #include <stdio.h>

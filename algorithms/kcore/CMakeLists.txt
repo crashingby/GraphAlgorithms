@@ -3,5 +3,5 @@ add_graph_cuda_executable(kcore_queue kcore tolerance_queue/kcore_tolerance_queu
 add_graph_mpi_nccl_executable(kcore_multiGPU kcore multigpu/kcore_tolerance_multiGPU.cu)
 add_graph_mpi_nccl_executable(kcore_multiGPU_basic kcore multigpu_basic/kcore_multiGPU_basic.cu)
 
-target_link_libraries(kcore_queue PRIVATE CUDA::nvToolsExt)
-target_link_libraries(kcore_multiGPU PRIVATE CUDA::nvToolsExt)
+target_link_libraries(kcore_queue PRIVATE CUDA::nvtx3)
+target_link_libraries(kcore_multiGPU PRIVATE CUDA::nvtx3)
